@@ -6,8 +6,11 @@
 mod error;
 mod event;
 mod field;
+mod lscl;
 mod timefmt;
 mod value;
+
+pub use lscl::{ConfigError, Pipeline, compile_imperative};
 
 pub use error::EventError;
 pub use event::Event;

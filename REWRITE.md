@@ -2,10 +2,10 @@
 
 - 形态：兼容重实现。交付物是纯 Rust 源码和一个 Rust 二进制。进程里没有 JVM、没有 JRuby、没有 Ruby 解释器，也不去调用 `java`。
 - 主案例：Rspack。
-- 当前切片：第 1 片已通过。下一位做第 2 片，LSCL 解析，验收 `cargo test parse_sections`。不要重写事件模型。
-- 上一片：第 1 片。验收命令 `cargo test event_fields`。结果：4 passed，0 failed。日期 2026-11-25。同一次还跑了 `cargo fmt` 和 `cargo clippy --all-targets -- -D warnings`，通过。
+- 当前切片：第 2、3、4 片已通过。下一位做第 5 片，内存管道，验收 `cargo test pipeline_generator_stdout`。不要重写事件模型和 LSCL 编译器。
+- 上一片：第 2 到第 4 片一起验收。命令 `cargo test event_fields parse_sections conditions compile_graph` 在 `cargo test` 里覆盖到了：event_fields 4 passed，parse_sections / conditions / compile_graph 3 passed，0 failed。日期 2026-11-25。同一次还跑了 `cargo fmt` 和 `cargo clippy --all-targets -- -D warnings`，通过。
 - 运行时只有 Rust，不嵌入 Java / Ruby，Cargo 只用纯 Rust crate。做不到时停下来问，不要为了编译去链 C 或启动 JVM。
-- 预言机：Logstash 9.5.2。发行包 JDK 是 Linux，在 WSL 里跑。管道输出在 `tests/fixtures/oracle/event_fields.out`，直接调用 `org.logstash.Event` / `Timestamp` 的输出在 `tests/fixtures/oracle/event_probe.out`。命令写在这两个文件头上。
+- 预言机：Logstash 9.5.2。发行包 JDK 是 Linux，在 WSL 里跑。管道输出在 `tests/fixtures/oracle/event_fields.out`，直接调用 `org.logstash.Event` / `Timestamp` 的输出在 `tests/fixtures/oracle/event_probe.out`。LSCL 编译结果在 `tests/fixtures/oracle/lscl_compile.txt`，由发行包里的 JRuby 调用 `LogStash::Compiler.compile_imperative` 打出来。命令写在这些文件头上。
 - 下一位只做本文件切片表里的下一片。不要从已经通过的切片重新翻译。
 
 进度回复固定包含：当前切片、验收命令、通过还是失败、下一块是什么。
@@ -78,16 +78,17 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - 日志原文和异常类名。旧：Log4j / Ruby 异常。新：`tracing` 和 `Result`。原因：没有采集规则依赖原文。
 - 二进制名。旧命令是 `logstash`。新二进制叫 `rstash`，参数对齐。原因：仓库名是 Rstash。
 - 监控 API 里的 JVM 堆、GC、hot threads。旧 JSON 有 JVM 字段。新进程没有 JVM。未确认。实现 `/_node/stats` 之前必须问，未确认不实现。
+- `nand` / `xor` 和 `and` / `or` 混用时两边都拒绝。旧报错文本是 JRuby `Method#inspect`。新文本是 `ArgumentError: Unexpected operator nand` 或 `xor`。已确认：失败条件对齐，不复制 JVM 方法签名。
 
 ## 切片
 
 依赖只指向已经通过的叶子。一轮只实现一片。
 
 - 第 1 片。事件、字段路径、`sprintf`、`@metadata`、`tags`、`@timestamp`。验收：`cargo test event_fields`。不引入 tokio、axum、clap。状态：通过。`@timestamp` 文本与 9.5.2 一致：纳秒为 0 时固定 3 位小数，否则按 3/6/9 位去掉末尾的零组。`%{+pattern}` 用 Joda 风格，目前只实现 `y` `Y` `M` `d` 和字面字符；`%{+%s}` 是 epoch 秒；`%{{pattern}}` 用同一套字母、不截断到毫秒。没实现的字母返回错误，不猜。字段路径按 Unicode 标量扫描，预言机里的路径都是 ASCII。
-- 第 2 片。LSCL 子集：注释、三段式、插件、属性、字符串、数字、数组、哈希。验收：`cargo test parse_sections`。状态：未开始。
-- 第 3 片。条件：`if/else/elsif`、比较、`in`、`=~`、`and/or/xor/nand`。验收：`cargo test conditions`。状态：未开始。
-- 第 4 片。编译成执行图：filter 顺序、input/output 并列、if 分支。验收：`cargo test compile_graph`。状态：未开始。
-- 第 5 片。内存管道跑通一条最小配置：`generator` count + `stdout`。批大小、delay、worker 数按默认值。验收：`cargo test pipeline_generator_stdout`。状态：未开始。
+- 第 2 片。LSCL 子集：注释、三段式、插件、属性、字符串、数字、数组、哈希。验收：`cargo test parse_sections`。状态：通过。语法按 `lscl_grammar.treetop` 的顺序做递归下降。`config.support_escapes` 默认 false，引号里的反斜杠原样保留；为 true 时才走 `StringEscape.process_escapes`。没有 `true` / `false` / `null` 关键字，两个字符以上的裸词是字符串。裸词至少两个字符，哈希键一个字母会报 treetop 那种 `Expected [A-Za-z0-9_]`。数字末尾只有点（`1.`）语法上能读出来，随后按 Ruby `Float()` 报 `ArgumentError`。重复属性：标量不同变成数组，相同保留一个；数组拼接；哈希按 `hash_merge_with_dups` 合并。哈希字面量里的重复键报 `Duplicate keys found`。input/output 上 `codec` 的值如果变成数组（写了两次，或写成 `codec => ["json"]`）报 multiple codec。插件值（例如 `codec => json { }`）的类型是 codec。
+- 第 3 片。条件：`if/else/elsif`、比较、`in`、`=~`、`and/or/xor/nand`。验收：`cargo test conditions`。状态：通过。`elsif` 不是关键字，`else if` 和连写的 `elseif` 才会变成嵌套 if。布尔运算是 `Condition#join_conditions`：`and` 优先级 2，`or` 优先级 1，只有左边优先级严格更高才弹出，所以同级是右结合。单独的 `nand` 是 `!(left && right)`，单独的 `xor` 是 `(!(left) && right) || (left && !(right))`；它们和别的布尔运算混用就报错。`=~` 右边的字符串会变成正则。方法调用没有实现，`length([aa])` 会退化成字段 `[aa]`，这是 9.5.2 的实际行为，不要改成报错。
+- 第 4 片。编译成执行图：filter 顺序、input/output 并列、if 分支。验收：`cargo test compile_graph`。状态：通过。空段是 noop；只有一个语句时不包一层；多个 filter 是 `do-sequence`，多个 input 或 output 是 `composed-parallel`。if 的空分支也是 noop。语句文本按 Java `toString` 的缩进来，方便和预言机逐字比较。插件参数里再嵌一个插件时，JRuby 的 `Hash#inspect` 会带上变化的对象 id，预言机改成按 `PluginDefinition` 打印，Rust 也按这个稳定形状输出。
+- 第 5 片。内存管道跑通一条最小配置：`generator` count + `stdout`。批大小、delay、worker 数按默认值。验收：`cargo test pipeline_generator_stdout`。状态：未开始。不要在这一片重写解析器。
 - 第 6 片。CLI：`-e`、`-f`、`-t`（配置对则退出 0，错则非 0）、`-w`、`-b`。验收：`cargo test cli_test_and_exit`。状态：未开始。
 - 第 7 片。内置 codec `plain`/`line` 和过滤器 `drop`，加上 `mutate` 的 add/remove/rename/convert 里 fixture 覆盖到的子集。验收：对应 `cargo test`。状态：未开始。
 - 第 8 片。`logstash.yml` 子集和 `pipelines.yml` 多管道（仍是内存队列）。验收：两条管道的事件互不串。状态：未开始。

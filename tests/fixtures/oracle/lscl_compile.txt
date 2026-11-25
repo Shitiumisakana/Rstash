@@ -1,0 +1,826 @@
+# logstash 9.5.2
+# command: jruby -I logstash-core/lib target/oracle-compile/dump.rb
+# date: 2026-11-25
+# Plugin-valued arguments are printed from PluginDefinition. JRuby Hash#inspect embeds a changing Java object id.
+BEGIN CASES
+===== CASE parse_basic escapes=false =====
+----- CONFIG -----
+input { generator { count => 1 message => "hello" } }
+filter { mutate { add_field => { "aa" => "b" "nn" => 2 } } }
+output { stdout { } }
+
+----- RESULT -----
+----- input -----
+  input-generator{"count" => 1, "message" => "hello"}
+----- filter -----
+  filter-mutate{"add_field" => {"aa" => "b", "nn" => 2}}
+----- output -----
+  output-stdout{}
+===== END =====
+===== CASE parse_comments escapes=false =====
+----- CONFIG -----
+# top
+input { # c
+  generator { count => 1 } # end
+}
+filter { # only
+}
+
+----- RESULT -----
+----- input -----
+  input-generator{"count" => 1}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_types escapes=false =====
+----- CONFIG -----
+input {
+  generator {
+    ii => 10
+    ff => 1.5
+    neg => -3
+    negf => -0.25
+    ten => 1.0
+    trail => 1.50
+    zero => 01
+    bare => hello_1
+    arr => [1, "a", true, false, null]
+    hash => { kk => "v" 2 => 3 }
+    empty_arr => []
+    empty_hash => {}
+    glued => { aa => 1 bb => 2 }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  input-generator{"ii" => 10, "ff" => 1.5, "neg" => -3, "negf" => -0.25, "ten" => 1.0, "trail" => 1.5, "zero" => 1, "bare" => "hello_1", "arr" => [1, "a", "true", "false", "null"], "hash" => {"kk" => "v", 2 => 3}, "empty_arr" => [], "empty_hash" => {}, "glued" => {"aa" => 1, "bb" => 2}}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_escapes_off escapes=false =====
+----- CONFIG -----
+input { generator { message => "say \"hi\" path" slash => 'a\b' } }
+
+----- RESULT -----
+----- input -----
+  input-generator{"message" => "say \\\"hi\\\" path", "slash" => "a\\b"}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_escapes_on escapes=true =====
+----- CONFIG -----
+input { generator { message => "say \"hi\"\nnext\t" } }
+
+----- RESULT -----
+----- input -----
+  input-generator{"message" => "say \"hi\"\nnext\t"}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_single_quote escapes=false =====
+----- CONFIG -----
+input { generator { message => 'say \'hi\'' } }
+
+----- RESULT -----
+----- input -----
+  input-generator{"message" => "say \\'hi\\'"}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_interp escapes=false =====
+----- CONFIG -----
+input { generator { message => "a#{b}" } }
+
+----- RESULT -----
+----- input -----
+  input-generator{"message" => "a\#{b}"}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_dup_attr_scalar escapes=false =====
+----- CONFIG -----
+input { generator { count => 1 count => 2 } }
+
+----- RESULT -----
+----- input -----
+  input-generator{"count" => [1, 2]}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_dup_attr_equal escapes=false =====
+----- CONFIG -----
+input { generator { count => 1 count => 1 } }
+
+----- RESULT -----
+----- input -----
+  input-generator{"count" => 1}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_dup_attr_array escapes=false =====
+----- CONFIG -----
+filter { mutate { add_tag => ["a"] add_tag => ["b"] add_tag => ["a"] } }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-mutate{"add_tag" => ["a", "b", "a"]}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_dup_attr_hash escapes=false =====
+----- CONFIG -----
+filter { mutate { add_field => { "aa" => "1" } add_field => { "bb" => "2" } } }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-mutate{"add_field" => {"aa" => "1", "bb" => "2"}}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_dup_attr_hash_overlap escapes=false =====
+----- CONFIG -----
+filter { mutate { add_field => { "aa" => "1" "bb" => "2" } add_field => { "aa" => "9" "cc" => "3" } } }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-mutate{"add_field" => {"aa" => ["1", "9"], "bb" => "2", "cc" => "3"}}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_string_plugin escapes=false =====
+----- CONFIG -----
+input { "generator" { count => 1 } }
+
+----- RESULT -----
+----- input -----
+  input-"generator"{"count" => 1}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_empty escapes=false =====
+----- CONFIG -----
+output { stdout { } }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  output-stdout{}
+===== END =====
+===== CASE parse_nested escapes=false =====
+----- CONFIG -----
+filter {
+  mutate { add_field => { "[a][b]" => [1, { "cc" => true }] } }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-mutate{"add_field" => {"[a][b]" => [1, {"cc" => "true"}]}}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE parse_codec_plugin escapes=false =====
+----- CONFIG -----
+output {
+  stdout {
+    codec => json {
+      charset => "UTF-8"
+    }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  output-stdout{"codec" => codec-json{"charset" => "UTF-8"}}
+===== END =====
+===== CASE error_parse_codec_array escapes=false =====
+----- CONFIG -----
+output { stdout { codec => ["json"] } }
+
+----- ERROR -----
+LogStash::ConfigurationError: The output plugin stdout at line 1 has multiple `codec` declarations - this is not a valid configuration, only one top-level `codec` per output plugin is supported.
+===== END =====
+===== CASE cond_if_else escapes=false =====
+----- CONFIG -----
+filter {
+  if [ok] {
+    mutate { add_tag => ["a"] }
+  } else {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.get('[ok]'))
+  filter-mutate{"add_tag" => ["a"]}
+  filter-drop{})
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_if_only escapes=false =====
+----- CONFIG -----
+filter {
+  if [ok] {
+    mutate { add_tag => ["a"] }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.get('[ok]'))
+  filter-mutate{"add_tag" => ["a"]}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_elsif escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] == 1 {
+    mutate { add_tag => ["a"] }
+  } else if [bb] != 2 {
+    drop { }
+  } else {
+    mutate { add_tag => ["c"] }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[aa]')==1)
+  filter-mutate{"add_tag" => ["a"]}
+  (if (event.getField('[bb]')!=2)
+  filter-drop{}
+  filter-mutate{"add_tag" => ["c"]}))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_elsif_chain escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] == 1 {
+    mutate { add_tag => ["a"] }
+  } else if [bb] == 2 {
+    mutate { add_tag => ["b"] }
+  } else if [cc] == 3 {
+    mutate { add_tag => ["c"] }
+  } else {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[aa]')==1)
+  filter-mutate{"add_tag" => ["a"]}
+  (if (event.getField('[bb]')==2)
+  filter-mutate{"add_tag" => ["b"]}
+  (if (event.getField('[cc]')==3)
+  filter-mutate{"add_tag" => ["c"]}
+  filter-drop{})))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_compare escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] > 1 and [bb] >= 2 or [cc] < 3 and [dd] <= 4 {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (((event.getField('[aa]')>1)&&(event.getField('[bb]')>=2))||((event.getField('[cc]')<3)&&(event.getField('[dd]')<=4)))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_assoc_and escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] and [bb] and [cc] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[aa]')&&(event.getField('[bb]')&&event.getField('[cc]')))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_or_and escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] or [bb] or [cc] and [dd] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[aa]')||(event.getField('[bb]')||(event.getField('[cc]')&&event.getField('[dd]'))))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_and_or_or escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] and [bb] or [cc] or [dd] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if ((event.getField('[aa]')&&event.getField('[bb]'))||(event.getField('[cc]')||event.getField('[dd]')))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_in_regex escapes=false =====
+----- CONFIG -----
+filter {
+  if "x" in [tags] and "y" not in [tags] and [msg] =~ /^a/ and [msg] !~ "b" and ![skip] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (('x'.include?event.getField('[tags]'))&&(!(('y'.include?event.getField('[tags]')))&&((event.getField('[msg]')=~^a)&&(!((event.getField('[msg]')=~b))&&!(event.getField('[skip]'))))))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_nand_xor escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] nand [bb] {
+    drop { }
+  }
+  if [aa] xor [bb] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+(do-sequence
+    (if !((event.getField('[aa]')&&event.getField('[bb]')))
+  filter-drop{}
+  (Noop))
+    (if ((!(event.getField('[aa]'))&&event.getField('[bb]'))||(event.getField('[aa]')&&!(event.getField('[bb]'))))
+  filter-drop{}
+  (Noop))
+
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_parens escapes=false =====
+----- CONFIG -----
+filter {
+  if ([aa] or [bb]) and [cc] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if ((event.getField('[aa]')||event.getField('[bb]'))&&event.getField('[cc]'))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_not_in_parens escapes=false =====
+----- CONFIG -----
+filter {
+  if !([aa] in [bb]) {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if !((event.getField('[aa]').include?event.getField('[bb]')))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_regex_escape escapes=false =====
+----- CONFIG -----
+filter {
+  if [msg] =~ /foo\/bar/ {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[msg]')=~foo\/bar)
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_glued escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa]and[bb] {
+    drop { }
+  } elseif [cc] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[aa]')&&event.getField('[bb]'))
+  filter-drop{}
+  (if (event.get('[cc]'))
+  filter-drop{}
+  (Noop)))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_in_array escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] in [1, "x"] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[aa]').include?[1, "x"])
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_string_eq escapes=false =====
+----- CONFIG -----
+filter {
+  if [ok] == "yes" and [n] > 1.5 {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if ((event.getField('[ok]')=='yes')&&(event.getField('[n]')>1.5))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE cond_empty_if escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] {
+  } else {
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.get('[aa]'))
+  (Noop)
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE graph_sequence escapes=false =====
+----- CONFIG -----
+filter {
+  mutate { add_tag => ["a"] }
+  mutate { add_tag => ["b"] }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+(do-sequence
+    filter-mutate{"add_tag" => ["a"]}
+    filter-mutate{"add_tag" => ["b"]}
+
+----- output -----
+  (Noop)
+===== END =====
+===== CASE graph_parallel escapes=false =====
+----- CONFIG -----
+input {
+  generator { count => 1 }
+  stdin { }
+}
+output {
+  stdout { }
+  stdout { codec => json }
+}
+
+----- RESULT -----
+----- input -----
+(composed-parallel
+    input-generator{"count" => 1}
+    input-stdin{}
+
+----- filter -----
+  (Noop)
+----- output -----
+(composed-parallel
+    output-stdout{}
+    output-stdout{"codec" => "json"}
+
+===== END =====
+===== CASE graph_multi_section escapes=false =====
+----- CONFIG -----
+input { generator { count => 1 } }
+input { stdin { } }
+filter { mutate { add_tag => ["a"] } }
+filter { drop { } }
+
+----- RESULT -----
+----- input -----
+(composed-parallel
+    input-generator{"count" => 1}
+    input-stdin{}
+
+----- filter -----
+(do-sequence
+    filter-mutate{"add_tag" => ["a"]}
+    filter-drop{}
+
+----- output -----
+  (Noop)
+===== END =====
+===== CASE graph_if_input escapes=false =====
+----- CONFIG -----
+input {
+  if [aa] {
+    generator { count => 1 }
+    stdin { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (if (event.get('[aa]'))
+(composed-parallel
+    input-generator{"count" => 1}
+    input-stdin{}
+
+  (Noop))
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE graph_if_among escapes=false =====
+----- CONFIG -----
+filter {
+  mutate { add_tag => ["a"] }
+  if [ok] {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+(do-sequence
+    filter-mutate{"add_tag" => ["a"]}
+    (if (event.get('[ok]'))
+  filter-drop{}
+  (Noop))
+
+----- output -----
+  (Noop)
+===== END =====
+===== CASE graph_nested_if escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] {
+    if [bb] {
+      drop { }
+    }
+    mutate { add_tag => ["z"] }
+  } else {
+    mutate { add_tag => ["e"] }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.get('[aa]'))
+(do-sequence
+    (if (event.get('[bb]'))
+  filter-drop{}
+  (Noop))
+    filter-mutate{"add_tag" => ["z"]}
+
+  filter-mutate{"add_tag" => ["e"]})
+----- output -----
+  (Noop)
+===== END =====
+===== CASE graph_output_if escapes=false =====
+----- CONFIG -----
+output {
+  if [aa] {
+    stdout { }
+    stdout { codec => json }
+  } else {
+    stdout { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.get('[aa]'))
+(composed-parallel
+    output-stdout{}
+    output-stdout{"codec" => "json"}
+
+  output-stdout{})
+===== END =====
+===== CASE error_parse_dup_hash escapes=false =====
+----- CONFIG -----
+input { generator { message => { "aa" => "1" "aa" => "2" } } }
+
+----- ERROR -----
+LogStash::ConfigurationError: Duplicate keys found in your configuration: ["aa"]
+At line: 1, column 32 (byte 32)
+after input { generator { message => {
+===== END =====
+===== CASE error_parse_dup_hash_bare escapes=false =====
+----- CONFIG -----
+filter { mutate { add_field => { aa => "1" aa => "2" } } }
+
+----- ERROR -----
+LogStash::ConfigurationError: Duplicate keys found in your configuration: [aa]
+At line: 1, column 32 (byte 32)
+after filter { mutate { add_field => {
+===== END =====
+===== CASE error_parse_multi_codec escapes=false =====
+----- CONFIG -----
+output { stdout { codec => json codec => rubydebug } }
+
+----- ERROR -----
+LogStash::ConfigurationError: The output plugin stdout at line 1 has multiple `codec` declarations - this is not a valid configuration, only one top-level `codec` per output plugin is supported.
+===== END =====
+===== CASE error_parse_bad_key escapes=false =====
+----- CONFIG -----
+input { generator { hash => { k => "v" } } }
+
+----- ERROR -----
+LogStash::ConfigurationError: Expected [A-Za-z0-9_] at line 1, column 32 (byte 32) after input { generator { hash => { k
+===== END =====
+===== CASE error_parse_float escapes=false =====
+----- CONFIG -----
+input { generator { one => 1. } }
+
+----- ERROR -----
+ArgumentError: invalid value for Float(): "1."
+===== END =====
+===== CASE error_cond_elsif escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] == 1 {
+    drop { }
+  } elsif [bb] == 2 {
+    drop { }
+  }
+}
+
+----- ERROR -----
+LogStash::ConfigurationError: Expected one of [ \t\r\n], "#", "{" at line 4, column 11 (byte 50) after filter {
+  if [aa] == 1 {
+    drop { }
+  } elsif 
+===== END =====
+===== CASE parse_blank escapes=false =====
+----- CONFIG -----
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE error_cond_nand escapes=false =====
+----- CONFIG -----
+filter {
+  if [aa] and [bb] nand [cc] {
+    drop { }
+  }
+}
+
+----- ERROR -----
+ArgumentError: Unexpected operator #<Method: #<Java::OrgLogstashConfigIr::DSL:Java::OrgLogstashConfigIr::DSL>#eNand(org.logstash.common.SourceWithMetadata,org.logstash.config.ir.expression.Expression,org.logstash.config.ir.expression.Expression)(eNand)()>
+===== END =====
+===== CASE cond_method escapes=false =====
+----- CONFIG -----
+filter {
+  if length([aa]) {
+    drop { }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.get('[aa]'))
+  filter-drop{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
