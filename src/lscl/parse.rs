@@ -1,28 +1,40 @@
+use super::ConfigSource;
 use super::model::{
-    Arg, ConfigError, Expr, Key, Kind, Pipeline, Plugin, Statement, compose, merge_attribute,
-    truthy,
+    Arg, ConfigError, Expr, Key, Kind, Pipeline, Plugin, SourceMeta, Statement, compose,
+    merge_attribute, truthy,
 };
 
-pub(crate) fn compile(source: &str, support_escapes: bool) -> Result<Pipeline, ConfigError> {
-    let mut parser = Parser::new(source, support_escapes);
-    parser.skip_cs();
+pub(crate) fn compile_sources(
+    sources: &[ConfigSource<'_>],
+    support_escapes: bool,
+) -> Result<Pipeline, ConfigError> {
     let mut input = Vec::new();
     let mut filter = Vec::new();
     let mut output = Vec::new();
-    while !parser.eof() {
-        let (kind, statements) = parser.parse_section()?;
-        match kind {
-            Kind::Input => input.extend(statements),
-            Kind::Filter => filter.extend(statements),
-            Kind::Output => output.extend(statements),
-            Kind::Codec => {}
-        }
+    for source in sources {
+        let mut parser = Parser::new(source.text, support_escapes, source.protocol, source.id);
         parser.skip_cs();
+        while !parser.eof() {
+            let (kind, statements) = parser.parse_section()?;
+            match kind {
+                Kind::Input => input.extend(statements),
+                Kind::Filter => filter.extend(statements),
+                Kind::Output => output.extend(statements),
+                Kind::Codec => {}
+            }
+            parser.skip_cs();
+        }
     }
+    let original_source = sources
+        .iter()
+        .map(|source| source.text)
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(Pipeline {
         input: compose(Kind::Input, input),
         filter: compose(Kind::Filter, filter),
         output: compose(Kind::Output, output),
+        original_source,
     })
 }
 
@@ -30,6 +42,8 @@ struct Parser<'a> {
     src: &'a str,
     index: usize,
     escapes: bool,
+    protocol: String,
+    id: String,
     max_failure: Option<usize>,
     failures: Vec<String>,
 }
@@ -69,6 +83,7 @@ enum Elem {
 struct Arm {
     cond: Expr,
     body: Vec<Statement>,
+    source: SourceMeta,
 }
 
 enum Tail {
@@ -80,14 +95,17 @@ struct BuiltIf {
     cond: Expr,
     body: Vec<Statement>,
     tail: Option<Tail>,
+    source: SourceMeta,
 }
 
 impl<'a> Parser<'a> {
-    fn new(src: &'a str, escapes: bool) -> Self {
+    fn new(src: &'a str, escapes: bool, protocol: &str, id: &str) -> Self {
         Self {
             src,
             index: 0,
             escapes,
+            protocol: protocol.to_string(),
+            id: id.to_string(),
             max_failure: None,
             failures: Vec::new(),
         }
@@ -269,7 +287,9 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.skip_cs();
+        let start = self.index;
         let cond = self.parse_condition()?;
+        let source = condition_source(self, start);
         self.skip_cs();
         let body = self.parse_block(kind)?;
         let mut elsifs = Vec::new();
@@ -284,10 +304,12 @@ impl<'a> Parser<'a> {
             self.skip_cs();
             if self.consume_keyword("if") {
                 self.skip_cs();
+                let start = self.index;
                 let cond = self.parse_condition()?;
+                let source = condition_source(self, start);
                 self.skip_cs();
                 let body = self.parse_block(kind)?;
-                elsifs.push(Arm { cond, body });
+                elsifs.push(Arm { cond, body, source });
                 continue;
             }
             if self.consume_char('{') {
@@ -298,7 +320,7 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(Some(compile_if(
-            Arm { cond, body },
+            Arm { cond, body, source },
             elsifs,
             else_body,
             kind,
@@ -335,19 +357,13 @@ impl<'a> Parser<'a> {
             self.fail_terminal(self.index, "plugin name");
             return Err(self.syntax_error());
         };
-        let line = line_of(self.src, start);
         self.skip_cs();
         if !self.consume_char('{') {
             self.fail_terminal(self.index, "\"{\"");
             return Err(self.syntax_error());
         }
         let args = self.parse_attributes()?;
-        let plugin = Plugin {
-            kind,
-            name,
-            args,
-            line,
-        };
+        let plugin = self.finish_plugin(kind, name, args, start);
         check_codecs(&plugin)?;
         Ok(plugin)
     }
@@ -357,7 +373,6 @@ impl<'a> Parser<'a> {
         let Some(name) = self.parse_plugin_name()? else {
             return Ok(None);
         };
-        let line = line_of(self.src, save);
         self.skip_cs();
         if !self.consume_char('{') {
             self.fail_terminal(self.index, "\"{\"");
@@ -365,14 +380,32 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         let args = self.parse_attributes()?;
-        let plugin = Plugin {
-            kind: Kind::Codec,
+        let plugin = self.finish_plugin(Kind::Codec, name, args, save);
+        check_codecs(&plugin)?;
+        Ok(Some(plugin))
+    }
+
+    fn finish_plugin(
+        &self,
+        kind: Kind,
+        name: String,
+        args: Vec<(String, Arg)>,
+        start: usize,
+    ) -> Plugin {
+        let (line, column) = line_column(self.src, start);
+        Plugin {
+            kind,
             name,
             args,
             line,
-        };
-        check_codecs(&plugin)?;
-        Ok(Some(plugin))
+            source: SourceMeta {
+                protocol: self.protocol.clone(),
+                id: self.id.clone(),
+                line,
+                column,
+                text: self.src[start..self.index].to_string(),
+            },
+        }
     }
 
     fn parse_plugin_name(&mut self) -> Result<Option<String>, ConfigError> {
@@ -568,7 +601,7 @@ impl<'a> Parser<'a> {
             })?;
             Ok(Some(Arg::Float(value)))
         } else {
-            Ok(Some(integer_arg(token)))
+            Ok(Some(integer_arg(token)?))
         }
     }
 
@@ -1119,6 +1152,7 @@ fn compile_if(
             cond: arm.cond,
             body: arm.body,
             tail: None,
+            source: arm.source,
         })
         .collect();
     if let Some(body) = else_body {
@@ -1130,6 +1164,7 @@ fn compile_if(
                     cond: first.cond,
                     body: first.body,
                     tail: Some(Tail::Body(body)),
+                    source: first.source,
                 },
                 kind,
             );
@@ -1148,6 +1183,7 @@ fn compile_if(
             cond: first.cond,
             body: first.body,
             tail,
+            source: first.source,
         },
         kind,
     )
@@ -1164,6 +1200,18 @@ fn lower_if(node: BuiltIf, kind: Kind) -> Statement {
         condition: truthy(node.cond),
         when_true: Box::new(when_true),
         when_false: Box::new(when_false),
+        source: node.source,
+    }
+}
+
+fn condition_source(parser: &Parser<'_>, start: usize) -> SourceMeta {
+    let (line, column) = line_column(parser.src, start);
+    SourceMeta {
+        protocol: parser.protocol.clone(),
+        id: parser.id.clone(),
+        line,
+        column,
+        text: parser.src[start..parser.index].to_string(),
     }
 }
 
@@ -1209,31 +1257,64 @@ fn duplicate_key_error(source: &str, brace: usize, keys: &[String]) -> ConfigErr
     ))
 }
 
-fn integer_arg(token: &str) -> Arg {
-    let canonical = canonical_integer(token);
-    match canonical.parse::<i64>() {
-        Ok(value) => Arg::Int(value),
-        Err(_) => Arg::Big(canonical),
-    }
-}
-
-fn canonical_integer(token: &str) -> String {
+/// `Kernel#Integer` on a grammar number token.
+///
+/// A leading zero selects octal. `08` and `09` are rejected. `010` is 8.
+fn integer_arg(token: &str) -> Result<Arg, ConfigError> {
     let (negative, digits) = if let Some(rest) = token.strip_prefix('-') {
         (true, rest)
     } else {
         (false, token)
     };
-    let digits = digits.trim_start_matches('0');
-    if digits.is_empty() {
-        "0".to_string()
-    } else if negative {
-        format!("-{digits}")
+    if digits.len() > 1 && digits.as_bytes()[0] == b'0' && digits.bytes().any(|digit| digit > b'7')
+    {
+        return Err(ConfigError::new(format!(
+            "ArgumentError: invalid value for Integer(): \"{token}\""
+        )));
+    }
+    let radix = if digits.len() > 1 && digits.as_bytes()[0] == b'0' {
+        8
     } else {
-        digits.to_string()
+        10
+    };
+    Ok(digits_to_int(digits, radix, negative))
+}
+
+fn digits_to_int(digits: &str, radix: u32, negative: bool) -> Arg {
+    let mut value = vec![0u8];
+    for ch in digits.chars() {
+        let Some(digit) = ch.to_digit(radix) else {
+            return Arg::Int(0);
+        };
+        let mut carry = digit;
+        for slot in &mut value {
+            let next = u32::from(*slot) * radix + carry;
+            *slot = (next % 10) as u8;
+            carry = next / 10;
+        }
+        while carry > 0 {
+            value.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    if value.iter().all(|digit| *digit == 0) {
+        return Arg::Int(0);
+    }
+    let mut text: String = value
+        .iter()
+        .rev()
+        .map(|digit| char::from(b'0' + digit))
+        .collect();
+    if negative {
+        text.insert(0, '-');
+    }
+    match text.parse::<i64>() {
+        Ok(number) => Arg::Int(number),
+        Err(_) => Arg::Big(text),
     }
 }
 
-fn process_escapes(input: &str) -> String {
+pub(crate) fn process_escapes(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::new();
     let mut index = 0;
@@ -1257,14 +1338,6 @@ fn process_escapes(input: &str) -> String {
         }
     }
     out
-}
-
-fn line_of(source: &str, index: usize) -> usize {
-    source[..index.min(source.len())]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        + 1
 }
 
 fn line_column(source: &str, index: usize) -> (usize, usize) {

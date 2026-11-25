@@ -2,8 +2,13 @@
 
 - 形态：兼容重实现。交付物是纯 Rust 源码和一个 Rust 二进制。进程里没有 JVM、没有 JRuby、没有 Ruby 解释器，也不去调用 `java`。
 - 主案例：Rspack。
-- 当前切片：第 2、3、4 片已通过。下一位做第 5 片，内存管道，验收 `cargo test pipeline_generator_stdout`。不要重写事件模型和 LSCL 编译器。
-- 上一片：第 2 到第 4 片一起验收。命令 `cargo test event_fields parse_sections conditions compile_graph` 在 `cargo test` 里覆盖到了：event_fields 4 passed，parse_sections / conditions / compile_graph 3 passed，0 failed。日期 2026-11-25。同一次还跑了 `cargo fmt` 和 `cargo clippy --all-targets -- -D warnings`，通过。
+- 当前切片：第 5 片还没开始。先用 Elastic v9.5.2 的官方测例复核了第 1 到第 4 片。下一位做第 5 片，内存管道，验收 `cargo test pipeline_generator_stdout`。不要重写事件模型和 LSCL 编译器。
+- 上一片：第 2 到第 4 片一起验收。命令 `cargo test` 覆盖 event_fields、parse_sections、conditions、compile_graph。日期 2026-11-25。后又加了 `cargo test --test official`。
+- 官方测试：发行包里没有 JUnit / RSpec。源在 `elastic/logstash` tag `v9.5.2`，本机副本在 `target/upstream/logstash`（已 gitignore）。这些测试构造的是 `org.logstash.Event` 和 JRuby，不能直接对 `rstash` 执行。对照方式是把同一批配置和断言喂给 Rust，编译期望值由 9.5.2 的 `compile_imperative` 打到 `tests/fixtures/oracle/official_compiler.txt`。
+- `compiler_spec.rb` 和 `config_ast_spec.rb` 里能落到 LSCL 的配置共 83 条，期望值是 9.5.2 `compile_imperative` 的图文本。另外按原断言核对了语句上的 source 协议、id、行号、列号和插件原文，`config.support_escapes` 打开时参数值是处理后的字符串。`010` 按 Ruby `Integer()` 是八进制 8。
+- 事件、字段、sprintf 的官方断言已改写成 `cargo test --test official_suite`。覆盖 `EventTest`、`event_spec.rb`、`FieldReferenceTest`、`StringInterpolationTest`、`string_escape_spec.rb` 里的可观察行为：`toJson` / `fromJson`、数组下标（含负数）、`tag`、`append`、`toString`、字段转义 `none` / `percent` / `ampersand`、`%{{YYYY-DDD}}`、`%{{YYYY-'W'ww}}`、`%{+%ss}`。
+- `ConfigCompilerTest`：空源和整段注释不产生插件，多段配置按顺序合并，`originalSource` 用换行拼起来。原文非空白时 `uniqueHash` 是这段原文的 SHA-256；原文缺失或只有空白时，用 `Graph#uniqueHash`：各插件和 if 的 `id|protocol|line|column|text` 先各自 SHA-256，排序拼接后再 SHA-256，queue 和 separator 不参与。`complex.cfg` 和 `spec/support/lscl_configs` 下 6 个文件能编过。`PipelineIR` 在 input 和 filter 之间放一个 queue，queue 后面不再有第二个 queue。
+- 不在前四片里、因此没有跑：CBOR 字节、JRuby 代理对象身份、字段引用缓存上限、`estimateMemory`、Ruby `NoMethodError`、`CompiledPipelineTest`、`EventConditionTest`。
 - 运行时只有 Rust，不嵌入 Java / Ruby，Cargo 只用纯 Rust crate。做不到时停下来问，不要为了编译去链 C 或启动 JVM。
 - 预言机：Logstash 9.5.2。发行包 JDK 是 Linux，在 WSL 里跑。管道输出在 `tests/fixtures/oracle/event_fields.out`，直接调用 `org.logstash.Event` / `Timestamp` 的输出在 `tests/fixtures/oracle/event_probe.out`。LSCL 编译结果在 `tests/fixtures/oracle/lscl_compile.txt`，由发行包里的 JRuby 调用 `LogStash::Compiler.compile_imperative` 打出来。命令写在这些文件头上。
 - 下一位只做本文件切片表里的下一片。不要从已经通过的切片重新翻译。
@@ -84,8 +89,8 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 依赖只指向已经通过的叶子。一轮只实现一片。
 
-- 第 1 片。事件、字段路径、`sprintf`、`@metadata`、`tags`、`@timestamp`。验收：`cargo test event_fields`。不引入 tokio、axum、clap。状态：通过。`@timestamp` 文本与 9.5.2 一致：纳秒为 0 时固定 3 位小数，否则按 3/6/9 位去掉末尾的零组。`%{+pattern}` 用 Joda 风格，目前只实现 `y` `Y` `M` `d` 和字面字符；`%{+%s}` 是 epoch 秒；`%{{pattern}}` 用同一套字母、不截断到毫秒。没实现的字母返回错误，不猜。字段路径按 Unicode 标量扫描，预言机里的路径都是 ASCII。
-- 第 2 片。LSCL 子集：注释、三段式、插件、属性、字符串、数字、数组、哈希。验收：`cargo test parse_sections`。状态：通过。语法按 `lscl_grammar.treetop` 的顺序做递归下降。`config.support_escapes` 默认 false，引号里的反斜杠原样保留；为 true 时才走 `StringEscape.process_escapes`。没有 `true` / `false` / `null` 关键字，两个字符以上的裸词是字符串。裸词至少两个字符，哈希键一个字母会报 treetop 那种 `Expected [A-Za-z0-9_]`。数字末尾只有点（`1.`）语法上能读出来，随后按 Ruby `Float()` 报 `ArgumentError`。重复属性：标量不同变成数组，相同保留一个；数组拼接；哈希按 `hash_merge_with_dups` 合并。哈希字面量里的重复键报 `Duplicate keys found`。input/output 上 `codec` 的值如果变成数组（写了两次，或写成 `codec => ["json"]`）报 multiple codec。插件值（例如 `codec => json { }`）的类型是 codec。
+- 第 1 片。事件、字段路径、`sprintf`、`@metadata`、`tags`、`@timestamp`。验收：`cargo test event_fields`，官方行为再加 `cargo test --test official_suite`。不引入 tokio、axum、clap。状态：通过。`@timestamp` 文本与 9.5.2 一致：纳秒为 0 时固定 3 位小数，否则按 3/6/9 位去掉末尾的零组。`%{+pattern}` 用 Joda 风格，`%{{pattern}}` 用 Java 风格。两种都认 `y` `Y` `M` `d` `D` `w` `s`、单引号字面量和普通字符；`%{+%s}` 是 epoch 秒。没实现的字母返回错误，不猜。已有数组用数字下标读取，负数从末尾数；`setField("[foo][0]")` 在父级还不存在时建的是键为 `"0"` 的 map。`tags` 只能是字符串、字符串数组或空；构造时如果 `tags` 是 map，改存到 `_tags` 并打上 `_tagsparsefailure`。字段路径按 Unicode 标量扫描，预言机里的路径都是 ASCII。
+- 第 2 片。LSCL 子集：注释、三段式、插件、属性、字符串、数字、数组、哈希。验收：`cargo test parse_sections`。状态：通过。语法按 `lscl_grammar.treetop` 的顺序做递归下降。`config.support_escapes` 默认 false，引号里的反斜杠原样保留；为 true 时才走 `StringEscape.process_escapes`。没有 `true` / `false` / `null` 关键字，两个字符以上的裸词是字符串。裸词至少两个字符，哈希键一个字母会报 treetop 那种 `Expected [A-Za-z0-9_]`。数字末尾只有点（`1.`）语法上能读出来，随后按 Ruby `Float()` 报 `ArgumentError`。整数走 Ruby `Integer()`：前导 0 是八进制，`010` 是 8，`08` 和 `09` 报 `ArgumentError`。重复属性：标量不同变成数组，相同保留一个；数组拼接；哈希按 `hash_merge_with_dups` 合并。哈希字面量里的重复键报 `Duplicate keys found`。input/output 上 `codec` 的值如果变成数组（写了两次，或写成 `codec => ["json"]`）报 multiple codec。插件值（例如 `codec => json { }`）的类型是 codec。
 - 第 3 片。条件：`if/else/elsif`、比较、`in`、`=~`、`and/or/xor/nand`。验收：`cargo test conditions`。状态：通过。`elsif` 不是关键字，`else if` 和连写的 `elseif` 才会变成嵌套 if。布尔运算是 `Condition#join_conditions`：`and` 优先级 2，`or` 优先级 1，只有左边优先级严格更高才弹出，所以同级是右结合。单独的 `nand` 是 `!(left && right)`，单独的 `xor` 是 `(!(left) && right) || (left && !(right))`；它们和别的布尔运算混用就报错。`=~` 右边的字符串会变成正则。方法调用没有实现，`length([aa])` 会退化成字段 `[aa]`，这是 9.5.2 的实际行为，不要改成报错。
 - 第 4 片。编译成执行图：filter 顺序、input/output 并列、if 分支。验收：`cargo test compile_graph`。状态：通过。空段是 noop；只有一个语句时不包一层；多个 filter 是 `do-sequence`，多个 input 或 output 是 `composed-parallel`。if 的空分支也是 noop。语句文本按 Java `toString` 的缩进来，方便和预言机逐字比较。插件参数里再嵌一个插件时，JRuby 的 `Hash#inspect` 会带上变化的对象 id，预言机改成按 `PluginDefinition` 打印，Rust 也按这个稳定形状输出。
 - 第 5 片。内存管道跑通一条最小配置：`generator` count + `stdout`。批大小、delay、worker 数按默认值。验收：`cargo test pipeline_generator_stdout`。状态：未开始。不要在这一片重写解析器。
@@ -122,4 +127,4 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## Git
 
-远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
+远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。`origin/master` 目前是 `bf7bf61`。这次官方测例复核和八进制修正还在本地，没有提交。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。

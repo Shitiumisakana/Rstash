@@ -38,6 +38,24 @@ fn format_letters(timestamp: DateTime<Utc>, pattern: &str) -> Result<String, Eve
     let mut output = String::new();
     let mut index = 0;
     while index < chars.len() {
+        if chars[index] == '\'' {
+            index += 1;
+            while index < chars.len() {
+                if chars[index] == '\'' {
+                    if chars.get(index + 1) == Some(&'\'') {
+                        output.push('\'');
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    output.push(chars[index]);
+                    index += 1;
+                }
+            }
+            continue;
+        }
         let letter = chars[index];
         if letter.is_ascii_alphabetic() {
             let mut end = index + 1;
@@ -50,6 +68,9 @@ fn format_letters(timestamp: DateTime<Utc>, pattern: &str) -> Result<String, Eve
                 'Y' => timestamp.iso_week().year(),
                 'M' => timestamp.month() as i32,
                 'd' => timestamp.day() as i32,
+                'D' => timestamp.ordinal() as i32,
+                'w' => timestamp.iso_week().week() as i32,
+                's' => timestamp.second() as i32,
                 _ => {
                     return Err(EventError::UnsupportedTimePattern {
                         pattern: pattern.to_string(),

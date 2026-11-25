@@ -59,6 +59,7 @@ impl Event {
 
     pub fn set_field(&mut self, reference: &str, value: Value) -> Result<(), EventError> {
         let field = field::parse_field(reference)?;
+        reject_illegal_tags(&field, &value)?;
         match field.target {
             Target::Data => set_path(&mut self.data, &field.path, &field.key, value),
             Target::Metadata => set_path(&mut self.metadata, &field.path, &field.key, value),
@@ -152,6 +153,154 @@ impl Event {
         Ok(output)
     }
 
+    /// Java `Event.toMap`. A new map, so later edits do not change the event.
+    pub fn to_map(&self) -> Map {
+        self.data.clone()
+    }
+
+    /// Ruby `to_hash_with_metadata`.
+    pub fn to_map_with_metadata(&self) -> Map {
+        let mut map = self.data.clone();
+        map.insert("@metadata", Value::Map(self.metadata.clone()));
+        map
+    }
+
+    /// Java `Event.toJson`: field data only, `@metadata` stays out.
+    pub fn to_json(&self) -> Result<String, EventError> {
+        map_to_json(&self.data)
+    }
+
+    /// Java `Event.fromJson`. Blank input yields no events.
+    pub fn from_json(json: &str) -> Result<Vec<Event>, EventError> {
+        Self::from_json_with(json, Event::from_data)
+    }
+
+    /// Ruby `Event.from_json` with a block. The block receives each object and returns the event.
+    pub fn from_json_with<F>(json: &str, mut factory: F) -> Result<Vec<Event>, EventError>
+    where
+        F: FnMut(Map) -> Event,
+    {
+        if json.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(json).map_err(|error| EventError::Json {
+                message: error.to_string(),
+            })?;
+        match parsed {
+            serde_json::Value::Object(_) => Ok(vec![factory(json_to_map(&parsed)?)]),
+            serde_json::Value::Array(items) => {
+                let mut events = Vec::with_capacity(items.len());
+                for item in items {
+                    let serde_json::Value::Object(_) = &item else {
+                        return Err(EventError::Json {
+                            message: String::from("json array elements must be objects"),
+                        });
+                    };
+                    events.push(factory(json_to_map(&item)?));
+                }
+                Ok(events)
+            }
+            other => Err(EventError::Json {
+                message: format!("incompatible json object type {other}"),
+            }),
+        }
+    }
+
+    /// Java `Event(Map)`. Keys are literal, including ones that look like field references.
+    pub fn from_data(mut data: Map) -> Self {
+        if data.get("@version").is_none() {
+            data.insert("@version", Value::from("1"));
+        }
+        let metadata = match data.remove("@metadata") {
+            Some(Value::Map(map)) => map,
+            _ => Map::new(),
+        };
+        if let Some(tags) = data.get("tags").cloned()
+            && !legal_tag_value(&tags)
+        {
+            data.insert("_tags", Value::Array(vec![tags]));
+            data.insert("tags", Value::Array(vec![Value::from("_tagsparsefailure")]));
+        }
+        let provided = data.get("@timestamp").cloned();
+        let parsed = match &provided {
+            Some(Value::Timestamp(timestamp)) => Some(*timestamp),
+            Some(Value::String(text)) => DateTime::parse_from_rfc3339(text)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc)),
+            Some(Value::Null) | None => Some(utc_now()),
+            Some(_) => None,
+        };
+        let mut event = Self {
+            data,
+            metadata,
+            cancelled: false,
+        };
+        match parsed {
+            Some(timestamp) => {
+                event.data.insert("@timestamp", Value::Timestamp(timestamp));
+            }
+            None => {
+                event.data.insert("@timestamp", Value::Timestamp(utc_now()));
+                event.tag("_timestampparsefailure");
+                if let Some(original) = provided {
+                    event.data.insert("_@timestamp", original);
+                }
+            }
+        }
+        event
+    }
+
+    /// Java `Event.tag`. The first tag creates a list. A repeated tag is not added again.
+    pub fn tag(&mut self, tag: &str) {
+        let tag_value = Value::from(tag);
+        match self.data.get("tags").cloned() {
+            None | Some(Value::Null) => {
+                self.data.insert("tags", Value::Array(vec![tag_value]));
+            }
+            Some(Value::Array(mut items)) => {
+                if !items.iter().any(|item| item == &tag_value) {
+                    items.push(tag_value);
+                    self.data.insert("tags", Value::Array(items));
+                }
+            }
+            Some(Value::String(existing)) => {
+                let mut items = vec![Value::String(existing)];
+                if items[0] != tag_value {
+                    items.push(tag_value);
+                }
+                self.data.insert("tags", Value::Array(items));
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Java `Event.append` / `Util.mapMerge` on the field map.
+    pub fn append(&mut self, other: &Event) {
+        map_merge(&mut self.data, &other.data);
+    }
+
+    /// Java `Event.toString`: timestamp, host, message. Missing host or message stays a sprintf token.
+    pub fn plain_string(&self) -> String {
+        let host = match self.get_field("host").ok().flatten() {
+            Some(value) => value.to_string(),
+            None => String::from("%{host}"),
+        };
+        let message = match self.get_field("message").ok().flatten() {
+            Some(value) => value.to_string(),
+            None => String::from("%{message}"),
+        };
+        let body = format!("{host} {message}");
+        match self.timestamp() {
+            Some(timestamp) => format!("{} {body}", format_timestamp(timestamp)),
+            None => body,
+        }
+    }
+
+    pub fn includes(&self, reference: &str) -> Result<bool, EventError> {
+        Ok(self.get_field(reference)?.is_some())
+    }
+
     fn timestamp(&self) -> Option<DateTime<Utc>> {
         match self.data.get("@timestamp") {
             Some(Value::Timestamp(timestamp)) => Some(*timestamp),
@@ -175,14 +324,36 @@ impl Default for Event {
 }
 
 fn descend_get<'a>(map: &'a Map, path: &[String], key: &str) -> Option<&'a Value> {
-    let mut current = map;
-    for segment in path {
-        match current.get(segment) {
-            Some(Value::Map(child)) => current = child,
-            _ => return None,
-        }
+    if path.is_empty() {
+        return present(fetch_map(map, key));
     }
-    match current.get(key) {
+    present(lookup_value(fetch_map(map, &path[0])?, &path[1..], key))
+}
+
+fn lookup_value<'a>(value: &'a Value, path: &[String], key: &str) -> Option<&'a Value> {
+    if path.is_empty() {
+        return fetch_value(value, key);
+    }
+    lookup_value(fetch_value(value, &path[0])?, &path[1..], key)
+}
+
+fn fetch_map<'a>(map: &'a Map, key: &str) -> Option<&'a Value> {
+    map.get(key)
+}
+
+fn fetch_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    match value {
+        Value::Map(map) => map.get(key),
+        Value::Array(items) => {
+            let index = list_index(key, items.len())?;
+            items.get(index)
+        }
+        _ => None,
+    }
+}
+
+fn present(value: Option<&Value>) -> Option<&Value> {
+    match value {
         Some(Value::Null) | None => None,
         Some(value) => Some(value),
     }
@@ -195,17 +366,82 @@ fn set_path(map: &mut Map, path: &[String], key: &str, value: Value) -> Result<(
     }
     let head = &path[0];
     let rest = &path[1..];
-    let next_field = rest.first().map(String::as_str).unwrap_or(key);
     if map.get(head).is_none() {
         map.insert(head.clone(), Value::Map(Map::new()));
     }
     let Some(current) = map.get_mut(head) else {
-        return Err(invalid_field_set(next_field, &Value::Null, &value));
+        return Err(invalid_field_set(key, &Value::Null, &value));
     };
-    match current {
-        Value::Map(child) => set_path(child, rest, key, value),
-        other => Err(invalid_field_set(next_field, other, &value)),
+    set_child(current, rest, key, value)
+}
+
+fn set_child(
+    current: &mut Value,
+    path: &[String],
+    key: &str,
+    value: Value,
+) -> Result<(), EventError> {
+    if path.is_empty() {
+        return match current {
+            Value::Map(map) => {
+                map.insert(key, value);
+                Ok(())
+            }
+            Value::Array(items) => set_on_list(items, key, value),
+            other => Err(invalid_field_set(key, other, &value)),
+        };
     }
+    let head = &path[0];
+    let rest = &path[1..];
+    match current {
+        Value::Map(map) => {
+            if map.get(head).is_none() {
+                map.insert(head.clone(), Value::Map(Map::new()));
+            }
+            let Some(child) = map.get_mut(head) else {
+                return Err(invalid_field_set(key, &Value::Null, &value));
+            };
+            set_child(child, rest, key, value)
+        }
+        Value::Array(items) => {
+            let Some(index) = list_index(head, items.len()) else {
+                return Err(invalid_field_set(
+                    head,
+                    &Value::Array(items.clone()),
+                    &value,
+                ));
+            };
+            let Some(child) = items.get_mut(index) else {
+                return Err(invalid_field_set(head, &Value::Array(Vec::new()), &value));
+            };
+            set_child(child, rest, key, value)
+        }
+        other => Err(invalid_field_set(head, other, &value)),
+    }
+}
+
+/// `Accessors.setOnList`. A non-numeric key is ignored. Indexes past the end pad with null.
+fn set_on_list(items: &mut Vec<Value>, key: &str, value: Value) -> Result<(), EventError> {
+    let Ok(index) = parse_java_int(key) else {
+        return Ok(());
+    };
+    let size = items.len() as i32;
+    if index >= size {
+        let mut cursor = size;
+        while cursor < index {
+            items.push(Value::Null);
+            cursor += 1;
+        }
+        items.push(value);
+        return Ok(());
+    }
+    let Some(at) = positive_index(index, items.len()) else {
+        return Err(invalid_field_set(key, &Value::Array(items.clone()), &value));
+    };
+    if let Some(slot) = items.get_mut(at) {
+        *slot = value;
+    }
+    Ok(())
 }
 
 fn remove_path(map: &mut Map, path: &[String], key: &str) -> Option<Value> {
@@ -214,10 +450,175 @@ fn remove_path(map: &mut Map, path: &[String], key: &str) -> Option<Value> {
     }
     let head = &path[0];
     let rest = &path[1..];
-    match map.get_mut(head) {
-        Some(Value::Map(child)) => remove_path(child, rest, key),
+    let child = map.get_mut(head)?;
+    remove_child(child, rest, key)
+}
+
+fn remove_child(current: &mut Value, path: &[String], key: &str) -> Option<Value> {
+    if path.is_empty() {
+        return match current {
+            Value::Map(map) => map.remove(key),
+            Value::Array(items) => {
+                let index = list_index(key, items.len())?;
+                Some(items.remove(index))
+            }
+            _ => None,
+        };
+    }
+    let head = &path[0];
+    let rest = &path[1..];
+    match current {
+        Value::Map(map) => remove_child(map.get_mut(head)?, rest, key),
+        Value::Array(items) => {
+            let index = list_index(head, items.len())?;
+            remove_child(items.get_mut(index)?, rest, key)
+        }
         _ => None,
     }
+}
+
+fn list_index(key: &str, size: usize) -> Option<usize> {
+    positive_index(parse_java_int(key).ok()?, size)
+}
+
+fn positive_index(index: i32, size: usize) -> Option<usize> {
+    let resolved = if index < 0 {
+        size as i32 + index
+    } else {
+        index
+    };
+    if resolved < 0 {
+        return None;
+    }
+    let resolved = resolved as usize;
+    if resolved >= size {
+        None
+    } else {
+        Some(resolved)
+    }
+}
+
+fn parse_java_int(key: &str) -> Result<i32, ()> {
+    let text = key.strip_prefix('+').unwrap_or(key);
+    text.parse::<i32>().map_err(|_| ())
+}
+
+fn reject_illegal_tags(field: &crate::field::FieldRef, value: &Value) -> Result<(), EventError> {
+    let tags_child = field.path.first().is_some_and(|segment| segment == "tags");
+    let tags_root = field.path.is_empty() && field.key == "tags";
+    if tags_child || (tags_root && !legal_tag_value(value)) {
+        Err(EventError::InvalidTags)
+    } else {
+        Ok(())
+    }
+}
+
+fn legal_tag_value(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::String(_) => true,
+        Value::Array(items) => items.iter().all(|item| matches!(item, Value::String(_))),
+        _ => false,
+    }
+}
+
+fn map_merge(target: &mut Map, add: &Map) {
+    for (key, entry) in add.iter() {
+        match target.get(key).cloned() {
+            None | Some(Value::Null) => target.insert(key, entry.clone()),
+            Some(Value::Map(mut child)) => match entry {
+                Value::Map(extra) => {
+                    map_merge(&mut child, extra);
+                    target.insert(key, Value::Map(child));
+                }
+                other => merge_scalar(target, key, &Value::Map(child), other),
+            },
+            Some(existing) => merge_scalar(target, key, &existing, entry),
+        }
+    }
+}
+
+fn merge_scalar(target: &mut Map, key: &str, existing: &Value, entry: &Value) {
+    match (existing, entry) {
+        (Value::Map(_), Value::Map(_)) => {}
+        (_, Value::Array(incoming)) => {
+            if let Value::Array(current) = existing {
+                target.insert(key, Value::Array(union_lists(current, incoming)));
+            } else {
+                let mut merged = vec![existing.clone()];
+                for item in incoming {
+                    if item != existing {
+                        merged.push(item.clone());
+                    }
+                }
+                target.insert(key, Value::Array(merged));
+            }
+        }
+        (Value::Array(current), _) => {
+            if !current.iter().any(|item| item == entry) {
+                let mut merged = current.clone();
+                merged.push(entry.clone());
+                target.insert(key, Value::Array(merged));
+            }
+        }
+        _ if existing != entry => {
+            target.insert(key, Value::Array(vec![existing.clone(), entry.clone()]));
+        }
+        _ => {}
+    }
+}
+
+fn union_lists(target: &[Value], source: &[Value]) -> Vec<Value> {
+    let mut merged = target.to_vec();
+    for item in source {
+        if !merged.iter().any(|existing| existing == item) {
+            merged.push(item.clone());
+        }
+    }
+    merged
+}
+
+fn json_to_map(value: &serde_json::Value) -> Result<Map, EventError> {
+    let serde_json::Value::Object(object) = value else {
+        return Err(EventError::Json {
+            message: String::from("json event must be an object"),
+        });
+    };
+    let mut map = Map::new();
+    for (key, child) in object {
+        map.insert(key, json_to_value(child)?);
+    }
+    Ok(map)
+}
+
+fn json_to_value(value: &serde_json::Value) -> Result<Value, EventError> {
+    Ok(match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(flag) => Value::Boolean(*flag),
+        serde_json::Value::Number(number) => {
+            if number.to_string().contains(['.', 'e', 'E']) {
+                Value::Float(number.as_f64().ok_or_else(|| EventError::Json {
+                    message: String::from("float is not a JSON number"),
+                })?)
+            } else if let Some(integer) = number.as_i64() {
+                Value::Integer(i128::from(integer))
+            } else if let Some(integer) = number.as_u64() {
+                Value::Integer(i128::from(integer))
+            } else {
+                return Err(EventError::Json {
+                    message: String::from("integer is outside i128"),
+                });
+            }
+        }
+        serde_json::Value::String(text) => Value::String(text.clone()),
+        serde_json::Value::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(json_to_value(item)?);
+            }
+            Value::Array(values)
+        }
+        serde_json::Value::Object(_) => Value::Map(json_to_map(value)?),
+    })
 }
 
 fn utc_now() -> DateTime<Utc> {
@@ -264,7 +665,13 @@ fn value_to_json(value: &Value) -> Result<serde_json::Value, EventError> {
     Ok(match value {
         Value::Null => serde_json::Value::Null,
         Value::String(text) => serde_json::Value::String(text.clone()),
-        Value::Integer(number) => serde_json::Value::Number((*number).into()),
+        Value::Integer(number) => {
+            if let Ok(small) = i64::try_from(*number) {
+                serde_json::Value::Number(small.into())
+            } else {
+                serde_json::Value::String(number.to_string())
+            }
+        }
         Value::Float(number) => serde_json::Number::from_f64(*number)
             .map(serde_json::Value::Number)
             .ok_or_else(|| EventError::Json {
@@ -272,6 +679,19 @@ fn value_to_json(value: &Value) -> Result<serde_json::Value, EventError> {
             })?,
         Value::Boolean(flag) => serde_json::Value::Bool(*flag),
         Value::Timestamp(timestamp) => serde_json::Value::String(format_timestamp(*timestamp)),
+        Value::Decimal(decimal) => {
+            if let Ok(integer) = decimal.as_str().parse::<i64>() {
+                serde_json::Value::Number(integer.into())
+            } else if let Ok(number) = decimal.as_str().parse::<f64>() {
+                serde_json::Number::from_f64(number)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| EventError::Json {
+                        message: String::from("decimal is not a JSON number"),
+                    })?
+            } else {
+                serde_json::Value::String(decimal.as_str().to_string())
+            }
+        }
         Value::Array(items) => {
             let mut array = Vec::with_capacity(items.len());
             for item in items {

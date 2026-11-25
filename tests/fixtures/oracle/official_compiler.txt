@@ -1,0 +1,1272 @@
+# logstash 9.5.2
+# source: elastic/logstash v9.5.2 logstash-core/spec/logstash/compiler/compiler_spec.rb
+# source: elastic/logstash v9.5.2 logstash-core/spec/logstash/config/config_ast_spec.rb
+# command: jruby -I logstash-core/lib target/oracle-compile/official.rb
+# date: 2026-11-25
+BEGIN CASES
+===== CASE spec_escapes_on escapes=true =====
+----- CONFIG -----
+input {
+  foo {
+    bar => "The computer says, \"No\""
+  }
+}
+
+----- RESULT -----
+----- input -----
+  input-foo{"bar" => "The computer says, \"No\""}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_escapes_off escapes=false =====
+----- CONFIG -----
+input {
+  foo {
+    bar => "The computer says, \"No\""
+  }
+}
+
+----- RESULT -----
+----- input -----
+  input-foo{"bar" => "The computer says, \\\"No\\\""}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_empty escapes=false =====
+----- CONFIG -----
+input {} output {}
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_simple_plugin escapes=false =====
+----- CONFIG -----
+input { generator {} } 
+----- RESULT -----
+----- input -----
+  input-generator{}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_mixed_params escapes=false =====
+----- CONFIG -----
+input { generator { aarg => [1] hasharg => {foo => bar} iarg => 123 farg => 123.123 sarg => 'hello'} } 
+----- RESULT -----
+----- input -----
+  input-generator{"aarg" => [1], "hasharg" => {"foo" => "bar"}, "iarg" => 123, "farg" => 123.123, "sarg" => "hello"}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_quoted_keys escapes=false =====
+----- CONFIG -----
+input { generator { notquoted => 1 'singlequoted' => 2 "doublequoted" => 3} } 
+----- RESULT -----
+----- input -----
+  input-generator{"notquoted" => 1, "singlequoted" => 2, "doublequoted" => 3}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_multi_array escapes=false =====
+----- CONFIG -----
+input { generator { aarg => [1] aarg => [2] aarg => [3]} } 
+----- RESULT -----
+----- input -----
+  input-generator{"aarg" => [1, 2, 3]}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_converge_array escapes=false =====
+----- CONFIG -----
+input { generator { aarg => [1] aarg => 2 aarg => '3' aarg => [4] } } 
+----- RESULT -----
+----- input -----
+  input-generator{"aarg" => [1, 2, "3", 4]}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_input_codec escapes=false =====
+----- CONFIG -----
+input { generator { codec => plain } } 
+----- RESULT -----
+----- input -----
+  input-generator{"codec" => "plain"}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_input_multi_codec escapes=false =====
+----- CONFIG -----
+input { generator { codec => plain codec => json } } 
+----- ERROR -----
+LogStash::ConfigurationError: The input plugin generator at line 1 has multiple `codec` declarations - this is not a valid configuration, only one top-level `codec` per input plugin is supported.
+===== END =====
+===== CASE spec_output_codec escapes=false =====
+----- CONFIG -----
+input { generator {} } output { stdout { codec => json } }
+----- RESULT -----
+----- input -----
+  input-generator{}
+----- filter -----
+  (Noop)
+----- output -----
+  output-stdout{"codec" => "json"}
+===== END =====
+===== CASE spec_output_multi_codec escapes=false =====
+----- CONFIG -----
+input { generator {} } output { stdout { codec => plain codec => json } }
+----- ERROR -----
+LogStash::ConfigurationError: The output plugin stdout at line 1 has multiple `codec` declarations - this is not a valid configuration, only one top-level `codec` per output plugin is supported.
+===== END =====
+===== CASE spec_grok_merge escapes=false =====
+----- CONFIG -----
+input { } filter {
+    grok {
+      match => { "message" => "%{WORD:word}" }
+      match => { "examplefield" => "%{NUMBER:num}" }
+      break_on_match => false
+    }
+} output { }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-grok{"match" => {"message" => "%{WORD:word}", "examplefield" => "%{NUMBER:num}"}, "break_on_match" => "false"}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_grok_dup escapes=false =====
+----- CONFIG -----
+input { } filter {
+    grok {
+      match => { "message" => "foo" }
+      match => { "message" => "bar" }
+      break_on_match => false
+    }
+} output { }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-grok{"match" => {"message" => ["foo", "bar"]}, "break_on_match" => "false"}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_nested_hash escapes=false =====
+----- CONFIG -----
+input { } filter {
+    matryoshka {
+      key => "%{host}"
+      filter_options => {
+        string  => "string"
+        integer => 3
+        nested  => {
+          string  => "nested-string"
+          integer => 7
+          "quoted-key-string" => "nested-quoted-key-string"
+          "quoted-key-integer" => 31
+          deep    => {
+            string  => "deeply-nested-string"
+            integer => 127
+            "quoted-key-string" => "deeply-nested-quoted-key-string"
+            "quoted-key-integer" => 8191
+          }
+        }
+      }
+      ttl => 5
+    }
+} output { }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-matryoshka{"key" => "%{host}", "filter_options" => {"string" => "string", "integer" => 3, "nested" => {"string" => "nested-string", "integer" => 7, "quoted-key-string" => "nested-quoted-key-string", "quoted-key-integer" => 31, "deep" => {"string" => "deeply-nested-string", "integer" => 127, "quoted-key-string" => "deeply-nested-quoted-key-string", "quoted-key-integer" => 8191}}}, "ttl" => 5}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_single_input escapes=false =====
+----- CONFIG -----
+input { generator {} }
+----- RESULT -----
+----- input -----
+  input-generator{}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_two_inputs escapes=false =====
+----- CONFIG -----
+input { generator { count => 1 } generator { count => 2 } } output { }
+----- RESULT -----
+----- input -----
+(composed-parallel
+    input-generator{"count" => 1}
+    input-generator{"count" => 2}
+
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_single_filter escapes=false =====
+----- CONFIG -----
+input { } filter { grok {} } output { }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  filter-grok{}
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_single_output escapes=false =====
+----- CONFIG -----
+input { } output { stdout {} }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  output-stdout{}
+===== END =====
+===== CASE spec_filter_two_sections escapes=false =====
+----- CONFIG -----
+filter {
+  aplugin { count => 1 }
+}
+
+filter {
+  aplugin { count => 2 }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+(do-sequence
+    filter-aplugin{"count" => 1}
+    filter-aplugin{"count" => 2}
+
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_two_plugins escapes=false =====
+----- CONFIG -----
+filter {
+  aplugin { count => 1 }
+  aplugin { count => 2 }
+  }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+(do-sequence
+    filter-aplugin{"count" => 1}
+    filter-aplugin{"count" => 2}
+
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_and escapes=false =====
+----- CONFIG -----
+filter { if (2 > 1 and 1 < 2) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if ((2>1)&&(1<2))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_in_array escapes=false =====
+----- CONFIG -----
+filter { if ('foo' in ['foo', 'bar']) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if ('foo'.include?["foo", "bar"])
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_not_in escapes=false =====
+----- CONFIG -----
+filter { if ('foo' not in ['foo', 'bar']) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if !(('foo'.include?["foo", "bar"]))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_not escapes=false =====
+----- CONFIG -----
+filter { if (!(1 > 2)) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if !((1>2))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_and_or escapes=false =====
+----- CONFIG -----
+filter { if (2 > 1 and 1 < 2 or 3 < 2) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (((2>1)&&(1<2))||(3<2))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_multi_or escapes=false =====
+----- CONFIG -----
+filter { if (2 > 1 or 1 < 2 or 3 < 2) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if ((2>1)||((1<2)||(3<2)))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_complex escapes=false =====
+----- CONFIG -----
+filter { if (1 > 2 and 3 > 4 or 6 > 7 and 8 > 9) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (((1>2)&&(3>4))||((6>7)&&(8>9)))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_nested_bool escapes=false =====
+----- CONFIG -----
+filter { if (1 > 2 and (1 > 2 and 3 > 4 or 6 > 7 and 8 > 9) or 6 > 7 and 8 > 9) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (((1>2)&&(((1>2)&&(3>4))||((6>7)&&(8>9))))||((6>7)&&(8>9)))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_field escapes=false =====
+----- CONFIG -----
+filter { if ([foo]) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.get('[foo]'))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_eq escapes=false =====
+----- CONFIG -----
+filter { if ([foo] == 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==5)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_neq escapes=false =====
+----- CONFIG -----
+filter { if ([foo] != 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')!=5)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_gt escapes=false =====
+----- CONFIG -----
+filter { if ([foo] > 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')>5)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_lt escapes=false =====
+----- CONFIG -----
+filter { if ([foo] < 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')<5)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_gte escapes=false =====
+----- CONFIG -----
+filter { if ([foo] >= 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')>=5)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_lte escapes=false =====
+----- CONFIG -----
+filter { if ([foo] <= 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')<=5)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_regex escapes=false =====
+----- CONFIG -----
+filter { if ([foo] =~ /^abc$/) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')=~^abc$)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_quoted_regex escapes=false =====
+----- CONFIG -----
+filter { if ([foo] =~ "\.\.") { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')=~\.\.)
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_expr_regex_neq escapes=false =====
+----- CONFIG -----
+filter { if ([foo] !~ /^abc$/) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if !((event.getField('[foo]')=~^abc$))
+  filter-aplugin{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_if_true escapes=false =====
+----- CONFIG -----
+filter { if [foo] == [bar] { grok {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  filter-grok{}
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_if_false escapes=false =====
+----- CONFIG -----
+filter { if [foo] == [bar] { } else { fplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  (Noop)
+  filter-fplugin{})
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_if_empty escapes=false =====
+----- CONFIG -----
+filter { if [foo] == [bar] { } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  (Noop)
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_if_else escapes=false =====
+----- CONFIG -----
+filter { if [foo] == [bar] { tplugin {} } else { fplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  filter-tplugin{}
+  filter-fplugin{})
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_if_elsif escapes=false =====
+----- CONFIG -----
+filter { if [foo] == [bar] { tplugin {} } else if [bar] == [baz] { eifplugin {} } else { fplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  filter-tplugin{}
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  filter-eifplugin{}
+  filter-fplugin{}))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_if_elsif_elsif escapes=false =====
+----- CONFIG -----
+filter {
+  if [foo] == [bar] { tplugin {} }
+  else if [bar] == [baz] { eifplugin {} }
+  else if [baz] == [bot] { eeifplugin {} }
+  else { fplugin {} }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  filter-tplugin{}
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  filter-eifplugin{}
+  (if (event.getField('[baz]')==event.getField('[bot]'))
+  filter-eeifplugin{}
+  filter-fplugin{})))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_filter_nested_if escapes=false =====
+----- CONFIG -----
+filter {
+  if [foo] == [bar] {
+    if [bar] == [baz] { aplugin {} }
+  } else {
+    if [bar] == [baz] { bplugin {} }
+    else if [baz] == [bot] { cplugin {} }
+    else { dplugin {} }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  filter-aplugin{}
+  (Noop))
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  filter-bplugin{}
+  (if (event.getField('[baz]')==event.getField('[bot]'))
+  filter-cplugin{}
+  filter-dplugin{})))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_output_two_sections escapes=false =====
+----- CONFIG -----
+output {
+  aplugin { count => 1 }
+}
+
+output {
+  aplugin { count => 2 }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+(composed-parallel
+    output-aplugin{"count" => 1}
+    output-aplugin{"count" => 2}
+
+===== END =====
+===== CASE spec_output_two_plugins escapes=false =====
+----- CONFIG -----
+output {
+  aplugin { count => 1 }
+  aplugin { count => 2 }
+  }
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+(composed-parallel
+    output-aplugin{"count" => 1}
+    output-aplugin{"count" => 2}
+
+===== END =====
+===== CASE spec_output_expr_and escapes=false =====
+----- CONFIG -----
+output { if (2 > 1 and 1 < 2) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if ((2>1)&&(1<2))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_in_array escapes=false =====
+----- CONFIG -----
+output { if ('foo' in ['foo', 'bar']) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if ('foo'.include?["foo", "bar"])
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_not_in escapes=false =====
+----- CONFIG -----
+output { if ('foo' not in ['foo', 'bar']) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if !(('foo'.include?["foo", "bar"]))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_not escapes=false =====
+----- CONFIG -----
+output { if (!(1 > 2)) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if !((1>2))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_and_or escapes=false =====
+----- CONFIG -----
+output { if (2 > 1 and 1 < 2 or 3 < 2) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (((2>1)&&(1<2))||(3<2))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_multi_or escapes=false =====
+----- CONFIG -----
+output { if (2 > 1 or 1 < 2 or 3 < 2) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if ((2>1)||((1<2)||(3<2)))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_complex escapes=false =====
+----- CONFIG -----
+output { if (1 > 2 and 3 > 4 or 6 > 7 and 8 > 9) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (((1>2)&&(3>4))||((6>7)&&(8>9)))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_nested_bool escapes=false =====
+----- CONFIG -----
+output { if (1 > 2 and (1 > 2 and 3 > 4 or 6 > 7 and 8 > 9) or 6 > 7 and 8 > 9) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (((1>2)&&(((1>2)&&(3>4))||((6>7)&&(8>9))))||((6>7)&&(8>9)))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_field escapes=false =====
+----- CONFIG -----
+output { if ([foo]) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.get('[foo]'))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_eq escapes=false =====
+----- CONFIG -----
+output { if ([foo] == 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==5)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_neq escapes=false =====
+----- CONFIG -----
+output { if ([foo] != 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')!=5)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_gt escapes=false =====
+----- CONFIG -----
+output { if ([foo] > 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')>5)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_lt escapes=false =====
+----- CONFIG -----
+output { if ([foo] < 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')<5)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_gte escapes=false =====
+----- CONFIG -----
+output { if ([foo] >= 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')>=5)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_lte escapes=false =====
+----- CONFIG -----
+output { if ([foo] <= 5) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')<=5)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_regex escapes=false =====
+----- CONFIG -----
+output { if ([foo] =~ /^abc$/) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')=~^abc$)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_quoted_regex escapes=false =====
+----- CONFIG -----
+output { if ([foo] =~ "\.\.") { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')=~\.\.)
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_expr_regex_neq escapes=false =====
+----- CONFIG -----
+output { if ([foo] !~ /^abc$/) { aplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if !((event.getField('[foo]')=~^abc$))
+  output-aplugin{}
+  (Noop))
+===== END =====
+===== CASE spec_output_if_true escapes=false =====
+----- CONFIG -----
+output { if [foo] == [bar] { grok {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  output-grok{}
+  (Noop))
+===== END =====
+===== CASE spec_output_if_false escapes=false =====
+----- CONFIG -----
+output { if [foo] == [bar] { } else { fplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  (Noop)
+  output-fplugin{})
+===== END =====
+===== CASE spec_output_if_empty escapes=false =====
+----- CONFIG -----
+output { if [foo] == [bar] { } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  (Noop)
+  (Noop))
+===== END =====
+===== CASE spec_output_if_else escapes=false =====
+----- CONFIG -----
+output { if [foo] == [bar] { tplugin {} } else { fplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  output-tplugin{}
+  output-fplugin{})
+===== END =====
+===== CASE spec_output_if_elsif escapes=false =====
+----- CONFIG -----
+output { if [foo] == [bar] { tplugin {} } else if [bar] == [baz] { eifplugin {} } else { fplugin {} } }
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  output-tplugin{}
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  output-eifplugin{}
+  output-fplugin{}))
+===== END =====
+===== CASE spec_output_if_elsif_elsif escapes=false =====
+----- CONFIG -----
+output {
+  if [foo] == [bar] { tplugin {} }
+  else if [bar] == [baz] { eifplugin {} }
+  else if [baz] == [bot] { eeifplugin {} }
+  else { fplugin {} }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  output-tplugin{}
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  output-eifplugin{}
+  (if (event.getField('[baz]')==event.getField('[bot]'))
+  output-eeifplugin{}
+  output-fplugin{})))
+===== END =====
+===== CASE spec_output_nested_if escapes=false =====
+----- CONFIG -----
+output {
+  if [foo] == [bar] {
+    if [bar] == [baz] { aplugin {} }
+  } else {
+    if [bar] == [baz] { bplugin {} }
+    else if [baz] == [bot] { cplugin {} }
+    else { dplugin {} }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (if (event.getField('[foo]')==event.getField('[bar]'))
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  output-aplugin{}
+  (Noop))
+  (if (event.getField('[bar]')==event.getField('[baz]'))
+  output-bplugin{}
+  (if (event.getField('[baz]')==event.getField('[bot]'))
+  output-cplugin{}
+  output-dplugin{})))
+===== END =====
+===== CASE spec_ast_quoted_name escapes=false =====
+----- CONFIG -----
+input {
+  example {
+    'foo' => 'bar'
+    test => { 'bar' => 'baz' }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  input-example{"foo" => "bar", "test" => {"bar" => "baz"}}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_ast_empty_filter escapes=false =====
+----- CONFIG -----
+filter {
+}
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_ast_hash_array escapes=false =====
+----- CONFIG -----
+input{
+  example {
+    match => {
+      "message"=> ["pattern1", "pattern2", "pattern3"]
+    }
+  }
+}
+
+----- RESULT -----
+----- input -----
+  input-example{"match" => {"message" => ["pattern1", "pattern2", "pattern3"]}}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_ast_multiline_or escapes=false =====
+----- CONFIG -----
+filter {
+  if [something]
+     or [anotherthing]
+     or [onemorething] {
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.getField('[something]')||(event.getField('[anotherthing]')||event.getField('[onemorething]')))
+  (Noop)
+  (Noop))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_ast_elsif_multiline escapes=false =====
+----- CONFIG -----
+filter {
+  if [notathing] {
+  } else if [something]
+        or [anotherthing]
+        or [onemorething] {
+  }
+}
+
+----- RESULT -----
+----- input -----
+  (Noop)
+----- filter -----
+  (if (event.get('[notathing]'))
+  (Noop)
+  (if (event.getField('[something]')||(event.getField('[anotherthing]')||event.getField('[onemorething]')))
+  (Noop)
+  (Noop)))
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_ast_dup_key escapes=false =====
+----- CONFIG -----
+input {
+  example {
+    match => {
+      "message"=> "pattern1"
+      "message"=> "pattern2"
+      "message"=> "pattern3"
+    }
+  }
+}
+
+----- ERROR -----
+LogStash::ConfigurationError: Duplicate keys found in your configuration: ["message"]
+At line: 3, column 14 (byte 34)
+after input {
+  example {
+    match => {
+===== END =====
+===== CASE spec_ast_dup_nested escapes=false =====
+----- CONFIG -----
+input {
+  example {
+    match => {
+      "message"=> "pattern1"
+      "more" => {
+        "cool" => true
+        "cool" => true
+      }
+    }
+  }
+}
+
+----- ERROR -----
+LogStash::ConfigurationError: Duplicate keys found in your configuration: ["cool"]
+At line: 5, column 17 (byte 81)
+after input {
+  example {
+    match => {
+      "message"=> "pattern1"
+      "more" => {
+===== END =====
+===== CASE spec_ast_bad_quotes escapes=false =====
+----- CONFIG -----
+input {
+  example {
+    match => {
+      "message"=> "pattern1"
+      ""more"" => {
+        "cool" => true
+      }
+    }
+  }
+}
+
+----- ERROR -----
+LogStash::ConfigurationError: Expected one of [ \t\r\n], "#", "=>" at line 5, column 9 (byte 73) after input {
+  example {
+    match => {
+      "message"=> "pattern1"
+      ""
+===== END =====
+===== CASE spec_ast_octal escapes=false =====
+----- CONFIG -----
+input {
+  example {
+    foo => 010
+  }
+}
+
+----- RESULT -----
+----- input -----
+  input-example{"foo" => 8}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_integer_octal_forms escapes=false =====
+----- CONFIG -----
+input {
+  example {
+    zero => 0
+    zeros => 00
+    one => 01
+    eight => 010
+    neg => -010
+  }
+}
+
+----- RESULT -----
+----- input -----
+  input-example{"zero" => 0, "zeros" => 0, "one" => 1, "eight" => 8, "neg" => -8}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====
+===== CASE spec_integer_bad_octal escapes=false =====
+----- CONFIG -----
+input {
+  example {
+    bad => 08
+  }
+}
+
+----- ERROR -----
+ArgumentError: invalid value for Integer(): "08"
+===== END =====
+===== CASE spec_ast_comments escapes=false =====
+----- CONFIG -----
+# early
+input # bla
+{ # bla
+  plugin # bla
+  # bla
+  { # bla
+    # bla
+    arg  # bla
+    => # bla
+    bareword # bla
+    # bla
+    hasharg => {
+      #preentry
+      "firstkey" => "firstvalue"
+      # bla
+      "middle" # bla
+      # bla
+      => # bla
+      # bla
+      "midvalue"  # bla
+      # bla
+      "lastkey" => "lastvalue"
+      # bla
+    }
+  } # bla
+# bla
+} # bla
+# comment ending in EOF:
+
+----- RESULT -----
+----- input -----
+  input-plugin{"arg" => "bareword", "hasharg" => {"firstkey" => "firstvalue", "middle" => "midvalue", "lastkey" => "lastvalue"}}
+----- filter -----
+  (Noop)
+----- output -----
+  (Noop)
+===== END =====

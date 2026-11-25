@@ -9,12 +9,32 @@ use chrono::{DateTime, Utc};
 pub enum Value {
     Null,
     String(String),
-    Integer(i64),
+    Integer(i128),
     Float(f64),
     Boolean(bool),
     Timestamp(DateTime<Utc>),
+    /// Exact decimal, the in-memory stand-in for Ruby `BigDecimal`.
+    Decimal(Decimal),
     Array(Vec<Value>),
     Map(Map),
+}
+
+/// A base-10 decimal kept as text so `1` stays `1`, not a binary float.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decimal {
+    text: String,
+}
+
+impl Decimal {
+    pub fn exact(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +124,7 @@ impl Display for Value {
             Value::Timestamp(timestamp) => {
                 formatter.write_str(&crate::timefmt::format_timestamp(*timestamp))
             }
+            Value::Decimal(decimal) => formatter.write_str(decimal.as_str()),
             Value::Array(items) => {
                 formatter.write_str("[")?;
                 for (index, item) in items.iter().enumerate() {

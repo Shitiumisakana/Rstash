@@ -76,12 +76,53 @@ impl Key {
     }
 }
 
+/// `org.logstash.common.SourceWithMetadata` attached to a compiled statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMeta {
+    pub protocol: String,
+    pub id: String,
+    pub line: usize,
+    pub column: usize,
+    pub text: String,
+}
+
+impl SourceMeta {
+    /// `SourceWithMetadata#hashSource` then SHA-256. Order is id, protocol, line, column, text.
+    pub fn unique_hash(&self) -> String {
+        sha256_hex(&format!(
+            "{}|{}|{}|{}|{}",
+            self.id, self.protocol, self.line, self.column, self.text
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Plugin {
     pub(crate) kind: Kind,
     pub(crate) name: String,
     pub(crate) args: Vec<(String, Arg)>,
     pub(crate) line: usize,
+    pub(crate) source: SourceMeta,
+}
+
+/// One plugin vertex from the compiled graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledPlugin {
+    pub role: String,
+    pub name: String,
+    pub protocol: String,
+    pub id: String,
+    pub line: usize,
+    pub column: usize,
+    pub text: String,
+}
+
+/// Vertices in the order `PipelineIR` chains them: input, queue, filter, separator, output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineVertex {
+    Plugin(CompiledPlugin),
+    Queue,
+    Separator,
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +413,7 @@ pub(crate) enum Statement {
         condition: Expr,
         when_true: Box<Statement>,
         when_false: Box<Statement>,
+        source: SourceMeta,
     },
     Sequence(Vec<Statement>),
     Parallel(Vec<Statement>),
@@ -393,6 +435,7 @@ impl Statement {
                 condition,
                 when_true,
                 when_false,
+                ..
             } => format!(
                 "{}(if {}\n{}\n{})",
                 " ".repeat(indent),
@@ -432,6 +475,7 @@ pub struct Pipeline {
     pub(crate) input: Statement,
     pub(crate) filter: Statement,
     pub(crate) output: Statement,
+    pub(crate) original_source: String,
 }
 
 impl Pipeline {
@@ -446,4 +490,175 @@ impl Pipeline {
     pub fn output_text(&self) -> String {
         self.output.render(2)
     }
+
+    /// Text passed to `PipelineIR`, sources joined with a newline.
+    pub fn original_source(&self) -> &str {
+        &self.original_source
+    }
+
+    /// `PipelineIR#uniqueHash`. A non-blank original source is SHA-256 of that text.
+    /// A missing or whitespace-only source uses `Graph#uniqueHash`.
+    pub fn unique_hash(&self) -> String {
+        if !self.original_source.is_empty()
+            && !self
+                .original_source
+                .chars()
+                .all(|character| character.is_whitespace())
+        {
+            return sha256_hex(&self.original_source);
+        }
+        self.graph_unique_hash()
+    }
+
+    /// `Graph#uniqueHash`: SHA-256 of the sorted source hashes, skipping queue and separator.
+    pub fn graph_unique_hash(&self) -> String {
+        let mut hashes = Vec::new();
+        collect_source_hashes(&self.input, &mut hashes);
+        collect_source_hashes(&self.filter, &mut hashes);
+        collect_source_hashes(&self.output, &mut hashes);
+        hashes.sort();
+        sha256_hex(&hashes.concat())
+    }
+
+    pub fn plugin_vertices(&self) -> Vec<CompiledPlugin> {
+        let mut plugins = Vec::new();
+        collect_plugins(&self.input, &mut plugins);
+        collect_plugins(&self.filter, &mut plugins);
+        collect_plugins(&self.output, &mut plugins);
+        plugins
+    }
+
+    /// `PipelineIR` constructor order. The queue sits between input and filter.
+    pub fn vertices(&self) -> Vec<PipelineVertex> {
+        let mut vertices = Vec::new();
+        push_vertices(&self.input, &mut vertices);
+        vertices.push(PipelineVertex::Queue);
+        push_vertices(&self.filter, &mut vertices);
+        vertices.push(PipelineVertex::Separator);
+        push_vertices(&self.output, &mut vertices);
+        vertices
+    }
+
+    /// Vertices strictly after the queue. `PipelineIRTest` expects no second queue there.
+    pub fn post_queue(&self) -> Vec<PipelineVertex> {
+        let vertices = self.vertices();
+        let queue = vertices
+            .iter()
+            .position(|vertex| matches!(vertex, PipelineVertex::Queue))
+            .expect("compiled pipeline has one queue");
+        vertices.into_iter().skip(queue + 1).collect()
+    }
+
+    /// String argument of the first plugin with this name. `compiler_spec` reads it directly.
+    pub fn plugin_string_argument(&self, plugin: &str, argument: &str) -> Option<String> {
+        fn walk(statement: &Statement, plugin: &str, argument: &str) -> Option<String> {
+            match statement {
+                Statement::Noop => None,
+                Statement::Plugin(found) if found.name == plugin => {
+                    found.args.iter().find_map(|(name, value)| {
+                        if name == argument {
+                            match value {
+                                Arg::String(text) => Some(text.clone()),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                }
+                Statement::Plugin(_) => None,
+                Statement::If {
+                    when_true,
+                    when_false,
+                    ..
+                } => {
+                    walk(when_true, plugin, argument).or_else(|| walk(when_false, plugin, argument))
+                }
+                Statement::Sequence(statements) | Statement::Parallel(statements) => statements
+                    .iter()
+                    .find_map(|statement| walk(statement, plugin, argument)),
+            }
+        }
+        walk(&self.input, plugin, argument)
+            .or_else(|| walk(&self.filter, plugin, argument))
+            .or_else(|| walk(&self.output, plugin, argument))
+    }
+}
+
+fn compiled_plugin(plugin: &Plugin) -> CompiledPlugin {
+    CompiledPlugin {
+        role: plugin.kind.as_str().to_string(),
+        name: plugin.name.clone(),
+        protocol: plugin.source.protocol.clone(),
+        id: plugin.source.id.clone(),
+        line: plugin.source.line,
+        column: plugin.source.column,
+        text: plugin.source.text.clone(),
+    }
+}
+
+fn collect_plugins(statement: &Statement, plugins: &mut Vec<CompiledPlugin>) {
+    match statement {
+        Statement::Noop => {}
+        Statement::Plugin(plugin) => plugins.push(compiled_plugin(plugin)),
+        Statement::If {
+            when_true,
+            when_false,
+            ..
+        } => {
+            collect_plugins(when_true, plugins);
+            collect_plugins(when_false, plugins);
+        }
+        Statement::Sequence(statements) | Statement::Parallel(statements) => {
+            for statement in statements {
+                collect_plugins(statement, plugins);
+            }
+        }
+    }
+}
+
+fn collect_source_hashes(statement: &Statement, hashes: &mut Vec<String>) {
+    match statement {
+        Statement::Noop => {}
+        Statement::Plugin(plugin) => hashes.push(plugin.source.unique_hash()),
+        Statement::If {
+            when_true,
+            when_false,
+            source,
+            ..
+        } => {
+            hashes.push(source.unique_hash());
+            collect_source_hashes(when_true, hashes);
+            collect_source_hashes(when_false, hashes);
+        }
+        Statement::Sequence(statements) | Statement::Parallel(statements) => {
+            for statement in statements {
+                collect_source_hashes(statement, hashes);
+            }
+        }
+    }
+}
+
+fn push_vertices(statement: &Statement, vertices: &mut Vec<PipelineVertex>) {
+    match statement {
+        Statement::Noop => {}
+        Statement::Plugin(plugin) => vertices.push(PipelineVertex::Plugin(compiled_plugin(plugin))),
+        Statement::If {
+            when_true,
+            when_false,
+            ..
+        } => {
+            push_vertices(when_true, vertices);
+            push_vertices(when_false, vertices);
+        }
+        Statement::Sequence(statements) | Statement::Parallel(statements) => {
+            for statement in statements {
+                push_vertices(statement, vertices);
+            }
+        }
+    }
+}
+
+fn sha256_hex(text: &str) -> String {
+    crate::digest::sha256_hex(text)
 }

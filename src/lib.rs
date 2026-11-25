@@ -3,6 +3,7 @@
 //! Field-reference scanning uses Unicode scalar values. The 9.5.2 oracle
 //! references are ASCII, where that matches Java's UTF-16 indexing.
 
+mod digest;
 mod error;
 mod event;
 mod field;
@@ -10,8 +11,16 @@ mod lscl;
 mod timefmt;
 mod value;
 
-pub use lscl::{ConfigError, Pipeline, compile_imperative};
+pub use digest::sha256_hex;
+pub use lscl::{
+    CompiledPlugin, ConfigError, ConfigSource, Pipeline, PipelineVertex, SourceMeta,
+    compile_imperative, compile_sources, process_string_escapes,
+};
 
 pub use error::EventError;
 pub use event::Event;
-pub use value::{Map, Value};
+pub use field::{
+    FieldEscape, FieldRef, Target, field_cache_len_after_distinct, intern_field, parse_field,
+    parse_field_escaped, same_interned_field,
+};
+pub use value::{Decimal, Map, Value};
