@@ -1,0 +1,1229 @@
+//! Memory pipeline for the compiled statement tree.
+//!
+//! Workers, batch size, and batch delay follow `environment.rb`: CPU count,
+//! 125, and 50 ms. Inputs push into one in-memory queue. Each worker takes a
+//! batch, runs the filter tree, then the output tree. A plugin that is not in
+//! this slice returns an error instead of being skipped.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::event::Event;
+use crate::lscl::Key;
+use crate::lscl::{Arg, Expr, Kind, Pipeline, Plugin, Statement, compile_imperative};
+use crate::value::Value;
+
+/// `pipeline.ecs_compatibility`. `v8` selects the v1 field names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ecs {
+    Disabled,
+    V1,
+    V8,
+}
+
+/// Pipeline settings from `environment.rb`, `logstash.yml`, and the CLI.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub workers: usize,
+    pub batch_size: usize,
+    pub batch_delay: Duration,
+    pub ecs: Ecs,
+    pub test_and_exit: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            workers: thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1),
+            batch_size: 125,
+            batch_delay: Duration::from_millis(50),
+            ecs: Ecs::V8,
+            test_and_exit: false,
+        }
+    }
+}
+
+/// Events that reached an output, and the bytes those outputs wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunResult {
+    pub stdout: String,
+    pub events: Vec<Event>,
+}
+
+#[derive(Debug)]
+pub struct RunError {
+    pub message: String,
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RunError {}
+
+fn fail(message: impl Into<String>) -> RunError {
+    RunError {
+        message: message.into(),
+    }
+}
+
+/// Compile and, unless `test_and_exit` is set, run one memory pipeline.
+pub fn run(config: &str, settings: &Settings) -> Result<RunResult, RunError> {
+    let pipeline = compile_imperative(config, false).map_err(|error| fail(error.to_string()))?;
+    if settings.test_and_exit {
+        check_plugins(&pipeline)?;
+        return Ok(RunResult {
+            stdout: String::new(),
+            events: Vec::new(),
+        });
+    }
+    execute(&pipeline, settings)
+}
+
+/// Run several pipelines. Each has its own queue, so events cannot cross.
+pub fn run_many(
+    pipelines: &[(String, String)],
+    settings: &Settings,
+) -> Result<Vec<(String, RunResult)>, RunError> {
+    let mut results = Vec::new();
+    for (id, config) in pipelines {
+        results.push((id.clone(), run(config, settings)?));
+    }
+    Ok(results)
+}
+
+fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunError> {
+    check_plugins(pipeline)?;
+    let inputs = input_plugins(&pipeline.input);
+    if inputs.is_empty() {
+        return Ok(RunResult {
+            stdout: String::new(),
+            events: Vec::new(),
+        });
+    }
+    let queue = Queue::new(inputs.len());
+    let shared = Arc::new(Shared {
+        queue,
+        filter: pipeline.filter.clone(),
+        output: pipeline.output.clone(),
+        settings: settings.clone(),
+        stdout: Mutex::new(String::new()),
+        events: Mutex::new(Vec::new()),
+        error: Mutex::new(None),
+    });
+    let mut producers = Vec::new();
+    for plugin in inputs {
+        let shared = Arc::clone(&shared);
+        let plugin = plugin.clone();
+        producers.push(thread::spawn(move || {
+            let produced = match plugin.name.as_str() {
+                "generator" => generator(&plugin, &shared.settings),
+                other => Err(fail(unimplemented(Kind::Input, other))),
+            };
+            match produced {
+                Ok(events) => {
+                    for event in events {
+                        shared.queue.push(event);
+                    }
+                }
+                Err(error) => {
+                    *shared.error.lock().expect("error") = Some(error.message);
+                }
+            }
+            shared.queue.close_input();
+        }));
+    }
+    let workers = settings.workers.max(1);
+    let mut consumers = Vec::new();
+    for _ in 0..workers {
+        let shared = Arc::clone(&shared);
+        consumers.push(thread::spawn(move || worker(&shared)));
+    }
+    for producer in producers {
+        producer.join().expect("input thread");
+    }
+    for consumer in consumers {
+        consumer.join().expect("worker thread");
+    }
+    if let Some(message) = shared.error.lock().expect("error").clone() {
+        return Err(fail(message));
+    }
+    Ok(RunResult {
+        stdout: shared.stdout.lock().expect("stdout").clone(),
+        events: shared.events.lock().expect("events").clone(),
+    })
+}
+
+struct Shared {
+    queue: Queue,
+    filter: Statement,
+    output: Statement,
+    settings: Settings,
+    stdout: Mutex<String>,
+    events: Mutex<Vec<Event>>,
+    error: Mutex<Option<String>>,
+}
+
+fn worker(shared: &Shared) {
+    let batch_size = shared.settings.batch_size.max(1);
+    while let Some(batch) = shared
+        .queue
+        .read_batch(batch_size, shared.settings.batch_delay)
+    {
+        for mut event in batch {
+            match apply(&shared.filter, &mut event, shared) {
+                Ok(true) => match apply(&shared.output, &mut event, shared) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        *shared.error.lock().expect("error") = Some(error.message);
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    *shared.error.lock().expect("error") = Some(error.message);
+                }
+            }
+        }
+    }
+}
+
+/// Returns false when a filter cancelled the event.
+fn apply(statement: &Statement, event: &mut Event, shared: &Shared) -> Result<bool, RunError> {
+    if event.is_cancelled() {
+        return Ok(false);
+    }
+    match statement {
+        Statement::Noop => Ok(true),
+        Statement::Sequence(children) | Statement::Parallel(children) => {
+            for child in children {
+                if !apply(child, event, shared)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Statement::If {
+            condition,
+            when_true,
+            when_false,
+            ..
+        } => {
+            if eval(condition, event)? {
+                apply(when_true, event, shared)
+            } else {
+                apply(when_false, event, shared)
+            }
+        }
+        Statement::Plugin(plugin) => dispatch(plugin, event, shared),
+    }
+}
+
+fn dispatch(plugin: &Plugin, event: &mut Event, shared: &Shared) -> Result<bool, RunError> {
+    match (plugin.kind, plugin.name.as_str()) {
+        (Kind::Filter, "drop") => {
+            if drop_event(plugin) {
+                event.cancel();
+                return Ok(false);
+            }
+            Ok(true)
+        }
+        (Kind::Filter, "mutate") => {
+            mutate(plugin, event)?;
+            Ok(true)
+        }
+        (Kind::Output, "stdout") => {
+            let encoded = encode_stdout(plugin, event)?;
+            shared.stdout.lock().expect("stdout").push_str(&encoded);
+            shared.events.lock().expect("events").push(event.clone());
+            Ok(true)
+        }
+        (kind, name) => Err(fail(unimplemented(kind, name))),
+    }
+}
+
+fn unimplemented(kind: Kind, name: &str) -> String {
+    let role = match kind {
+        Kind::Input => "input",
+        Kind::Filter => "filter",
+        Kind::Output => "output",
+        Kind::Codec => "codec",
+    };
+    format!("plugin {role} {name} is not implemented")
+}
+
+fn check_plugins(pipeline: &Pipeline) -> Result<(), RunError> {
+    check_input(&pipeline.input)?;
+    check_statement(&pipeline.filter)?;
+    check_statement(&pipeline.output)?;
+    Ok(())
+}
+
+fn check_input(statement: &Statement) -> Result<(), RunError> {
+    match statement {
+        Statement::If { .. } => Err(fail(
+            "conditional inputs are not implemented; an if in the input section would have to choose one branch",
+        )),
+        Statement::Sequence(children) | Statement::Parallel(children) => {
+            for child in children {
+                check_input(child)?;
+            }
+            Ok(())
+        }
+        other => check_statement(other),
+    }
+}
+
+fn check_statement(statement: &Statement) -> Result<(), RunError> {
+    match statement {
+        Statement::Noop => Ok(()),
+        Statement::Sequence(children) | Statement::Parallel(children) => {
+            for child in children {
+                check_statement(child)?;
+            }
+            Ok(())
+        }
+        Statement::If {
+            when_true,
+            when_false,
+            ..
+        } => {
+            check_statement(when_true)?;
+            check_statement(when_false)?;
+            Ok(())
+        }
+        Statement::Plugin(plugin) => {
+            let known = matches!(
+                (plugin.kind, plugin.name.as_str()),
+                (Kind::Input, "generator")
+                    | (Kind::Filter, "drop" | "mutate")
+                    | (Kind::Output, "stdout")
+                    | (Kind::Codec, "plain" | "line")
+            );
+            if !known {
+                return Err(fail(unimplemented(plugin.kind, &plugin.name)));
+            }
+            if plugin.kind == Kind::Output && plugin.name == "stdout" {
+                match codec_name(plugin) {
+                    Some("plain" | "line") => {}
+                    _ => return Err(fail("plugin codec rubydebug is not implemented")),
+                }
+            }
+            for (_, value) in &plugin.args {
+                check_arg(value)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn check_arg(arg: &Arg) -> Result<(), RunError> {
+    match arg {
+        Arg::Plugin(plugin) => {
+            if !matches!(
+                (plugin.kind, plugin.name.as_str()),
+                (Kind::Codec, "plain" | "line")
+            ) {
+                return Err(fail(unimplemented(plugin.kind, &plugin.name)));
+            }
+            Ok(())
+        }
+        Arg::Array(items) => {
+            for item in items {
+                check_arg(item)?;
+            }
+            Ok(())
+        }
+        Arg::Map(entries) => {
+            for (_, value) in entries {
+                check_arg(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn input_plugins(statement: &Statement) -> Vec<&Plugin> {
+    let mut found = Vec::new();
+    collect_inputs(statement, &mut found);
+    found
+}
+
+fn collect_inputs<'a>(statement: &'a Statement, found: &mut Vec<&'a Plugin>) {
+    match statement {
+        Statement::Plugin(plugin) => found.push(plugin),
+        Statement::Sequence(children) | Statement::Parallel(children) => {
+            for child in children {
+                collect_inputs(child, found);
+            }
+        }
+        Statement::If {
+            when_true,
+            when_false,
+            ..
+        } => {
+            collect_inputs(when_true, found);
+            collect_inputs(when_false, found);
+        }
+        Statement::Noop => {}
+    }
+}
+
+fn generator(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunError> {
+    let count = arg_i64(plugin, "count").unwrap_or(0);
+    if arg(plugin, "lines").is_none() && arg_string(plugin, "message").as_deref() == Some("stdin") {
+        return Err(fail("generator message => \"stdin\" is not implemented"));
+    }
+    if count <= 0 {
+        return Err(fail(
+            "generator count must be greater than 0; 0 means unlimited and this pipeline does not run forever",
+        ));
+    }
+    let lines = match arg(plugin, "lines") {
+        Some(Arg::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Arg::String(text) => Ok(text.clone()),
+                _ => Err(fail("generator lines entries must be strings")),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(fail("generator lines must be an array")),
+        None => {
+            vec![arg_string(plugin, "message").unwrap_or_else(|| "Hello world!".to_string())]
+        }
+    };
+    let host = hostname();
+    let ecs_v1 = settings.ecs != Ecs::Disabled;
+    let (host_field, sequence_field) = if ecs_v1 {
+        ("[host][name]", "[event][sequence]")
+    } else {
+        ("host", "sequence")
+    };
+    let codec = codec_of(plugin, "plain")?;
+    let mut pending = String::new();
+    let mut events = Vec::new();
+    for number in 0..count {
+        for line in &lines {
+            for message in codec_decode(&codec, &mut pending, line)? {
+                events.push(finish_generated(
+                    plugin,
+                    message,
+                    Some(number),
+                    &host,
+                    host_field,
+                    sequence_field,
+                    ecs_v1,
+                )?);
+            }
+        }
+    }
+    if codec.name == "line" && !pending.is_empty() {
+        let message = std::mem::take(&mut pending);
+        events.push(finish_generated(
+            plugin,
+            message,
+            None,
+            &host,
+            host_field,
+            sequence_field,
+            ecs_v1,
+        )?);
+    }
+    Ok(events)
+}
+
+fn finish_generated(
+    plugin: &Plugin,
+    message: String,
+    sequence: Option<i64>,
+    host: &str,
+    host_field: &str,
+    sequence_field: &str,
+    ecs_v1: bool,
+) -> Result<Event, RunError> {
+    let mut event = Event::new();
+    event
+        .set_field("message", Value::from(message.clone()))
+        .map_err(event_fail)?;
+    if ecs_v1 {
+        event
+            .set_field("[event][original]", Value::from(message))
+            .map_err(event_fail)?;
+    }
+    decorate(plugin, &mut event)?;
+    if !event.includes(host_field).map_err(event_fail)? {
+        event
+            .set_field(host_field, Value::from(host))
+            .map_err(event_fail)?;
+    }
+    if let Some(sequence) = sequence {
+        event
+            .set_field(sequence_field, Value::Integer(i128::from(sequence)))
+            .map_err(event_fail)?;
+    }
+    Ok(event)
+}
+
+fn codec_decode(
+    codec: &CodecSpec,
+    pending: &mut String,
+    data: &str,
+) -> Result<Vec<String>, RunError> {
+    match codec.name.as_str() {
+        "plain" => Ok(vec![data.to_string()]),
+        "line" => {
+            pending.push_str(data);
+            let mut lines = Vec::new();
+            while let Some(index) = pending.find(&codec.delimiter) {
+                let line = pending[..index].to_string();
+                pending.replace_range(..index + codec.delimiter.len(), "");
+                lines.push(line);
+            }
+            Ok(lines)
+        }
+        other => Err(fail(format!("plugin codec {other} is not implemented"))),
+    }
+}
+
+fn decorate(plugin: &Plugin, event: &mut Event) -> Result<(), RunError> {
+    if let Some(Arg::Map(entries)) = arg(plugin, "add_field") {
+        for (key, value) in entries {
+            let field = event.sprintf(&key_text(key)).map_err(event_fail)?;
+            let text = event.sprintf(&arg_text(value)?).map_err(event_fail)?;
+            add_field(event, &field, Value::from(text))?;
+        }
+    }
+    if let Some(Arg::Array(tags)) = arg(plugin, "add_tag").or_else(|| arg(plugin, "tags")) {
+        for tag in tags {
+            event.tag(&event.sprintf(&arg_text(tag)?).map_err(event_fail)?);
+        }
+    }
+    Ok(())
+}
+
+fn encode_stdout(plugin: &Plugin, event: &Event) -> Result<String, RunError> {
+    let codec = codec_of(plugin, "rubydebug")?;
+    let body = if let Some(format) = &codec.format {
+        event.sprintf(format).map_err(event_fail)?
+    } else {
+        match codec.name.as_str() {
+            "plain" | "line" => event.plain_string(),
+            other => return Err(fail(format!("plugin codec {other} is not implemented"))),
+        }
+    };
+    Ok(if codec.name == "line" {
+        body + &codec.delimiter
+    } else {
+        body
+    })
+}
+
+struct CodecSpec {
+    name: String,
+    delimiter: String,
+    format: Option<String>,
+}
+
+fn codec_name(plugin: &Plugin) -> Option<&str> {
+    match arg(plugin, "codec") {
+        Some(Arg::String(name)) => Some(name),
+        Some(Arg::Plugin(codec)) => Some(codec.name.as_str()),
+        _ => None,
+    }
+}
+
+fn codec_of(plugin: &Plugin, default_name: &str) -> Result<CodecSpec, RunError> {
+    match arg(plugin, "codec") {
+        None => {
+            if default_name == "rubydebug" {
+                return Err(fail("plugin codec rubydebug is not implemented"));
+            }
+            Ok(CodecSpec {
+                name: default_name.to_string(),
+                delimiter: "\n".to_string(),
+                format: None,
+            })
+        }
+        Some(Arg::String(name)) => Ok(CodecSpec {
+            name: name.clone(),
+            delimiter: "\n".to_string(),
+            format: None,
+        }),
+        Some(Arg::Plugin(codec)) => Ok(CodecSpec {
+            name: codec.name.clone(),
+            delimiter: arg_string(codec, "delimiter").unwrap_or_else(|| "\n".to_string()),
+            format: arg_string(codec, "format"),
+        }),
+        Some(_) => Err(fail("codec must be a name or a codec block")),
+    }
+}
+
+fn event_fail(error: crate::EventError) -> RunError {
+    fail(error.to_string())
+}
+
+/// `logstash-filter-drop`: percentage 100 always cancels. Any other value
+/// cancels when a unit random draw is strictly below percentage/100.
+fn drop_event(plugin: &Plugin) -> bool {
+    let percentage = arg_f64(plugin, "percentage").unwrap_or(100.0);
+    if (percentage - 100.0).abs() < f64::EPSILON {
+        return true;
+    }
+    unit_random() < percentage / 100.0
+}
+
+fn unit_random() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    f64::from(nanos % 1_000_000) / 1_000_000.0
+}
+
+/// Subset of `logstash-filter-mutate`: rename, convert, then add_field and
+/// remove_field in the order `filter_matched` applies them.
+fn mutate(plugin: &Plugin, event: &mut Event) -> Result<(), RunError> {
+    for (name, _) in &plugin.args {
+        if !matches!(
+            name.as_str(),
+            "rename"
+                | "convert"
+                | "add_field"
+                | "remove_field"
+                | "id"
+                | "enable_metric"
+                | "tag_on_failure"
+        ) {
+            return Err(fail(format!("mutate option {name} is not implemented")));
+        }
+    }
+    if let Some(Arg::Map(entries)) = arg(plugin, "rename") {
+        for (key, value) in entries {
+            let old = event.sprintf(&key_text(key)).map_err(event_fail)?;
+            let new = event.sprintf(&arg_text(value)?).map_err(event_fail)?;
+            if event.includes(&old).map_err(event_fail)?
+                && let Some(removed) = event.remove_field(&old).map_err(event_fail)?
+            {
+                event.set_field(&new, removed).map_err(event_fail)?;
+            }
+        }
+    }
+    if let Some(Arg::Map(entries)) = arg(plugin, "convert") {
+        for (key, value) in entries {
+            let field = event.sprintf(&key_text(key)).map_err(event_fail)?;
+            let kind = arg_text(value)?;
+            convert_field(event, &field, &kind)?;
+        }
+    }
+    if let Some(Arg::Map(entries)) = arg(plugin, "add_field") {
+        for (key, value) in entries {
+            let field = event.sprintf(&key_text(key)).map_err(event_fail)?;
+            let text = event.sprintf(&arg_text(value)?).map_err(event_fail)?;
+            add_field(event, &field, Value::from(text))?;
+        }
+    }
+    if let Some(Arg::Array(fields)) = arg(plugin, "remove_field") {
+        for field in fields {
+            let name = event.sprintf(&arg_text(field)?).map_err(event_fail)?;
+            event.remove_field(&name).map_err(event_fail)?;
+        }
+    } else if let Some(Arg::String(field)) = arg(plugin, "remove_field") {
+        let name = event.sprintf(field).map_err(event_fail)?;
+        event.remove_field(&name).map_err(event_fail)?;
+    }
+    Ok(())
+}
+
+fn add_field(event: &mut Event, field: &str, value: Value) -> Result<(), RunError> {
+    if event.includes(field).map_err(event_fail)? {
+        let mut list = match event.remove_field(field).map_err(event_fail)? {
+            Some(Value::Array(items)) => items,
+            Some(existing) => vec![existing],
+            None => Vec::new(),
+        };
+        list.push(value);
+        event
+            .set_field(field, Value::Array(list))
+            .map_err(event_fail)
+    } else {
+        event.set_field(field, value).map_err(event_fail)
+    }
+}
+
+fn convert_field(event: &mut Event, field: &str, kind: &str) -> Result<(), RunError> {
+    if !event.includes(field).map_err(event_fail)? {
+        return Ok(());
+    }
+    let Some(current) = event.get_field(field).map_err(event_fail)? else {
+        return Ok(());
+    };
+    if matches!(current, Value::Map(_)) {
+        return Ok(());
+    }
+    let converted = match current {
+        Value::Array(items) => {
+            let mut next = Vec::new();
+            for item in items {
+                next.push(convert_value(item, kind));
+            }
+            Value::Array(next)
+        }
+        other => convert_value(other, kind),
+    };
+    event.set_field(field, converted).map_err(event_fail)
+}
+
+fn convert_value(value: Value, kind: &str) -> Value {
+    if matches!(value, Value::Null) {
+        return value;
+    }
+    match kind {
+        "string" => Value::from(value.to_string()),
+        "integer" => convert_integer(value),
+        "float" => convert_float(value),
+        "boolean" => convert_boolean(value),
+        _ => value,
+    }
+}
+
+fn convert_integer(value: Value) -> Value {
+    match value {
+        Value::Integer(number) => Value::Integer(number),
+        Value::Boolean(true) => Value::Integer(1),
+        Value::Boolean(false) => Value::Integer(0),
+        Value::Float(number) => Value::Integer(number as i128),
+        Value::String(text) => parse_integer_text(&text).unwrap_or(Value::String(text)),
+        other => other,
+    }
+}
+
+fn parse_integer_text(text: &str) -> Option<Value> {
+    let cleaned: String = text
+        .chars()
+        .filter(|ch| *ch != ',')
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if let Ok(number) = cleaned.parse::<i128>() {
+        return Some(Value::Integer(number));
+    }
+    let number = cleaned.parse::<f64>().ok()?;
+    Some(Value::Integer(number as i128))
+}
+
+fn convert_float(value: Value) -> Value {
+    match value {
+        Value::Float(number) => Value::Float(number),
+        Value::Integer(number) => Value::Float(number as f64),
+        Value::String(text) => {
+            let cleaned: String = text.chars().filter(|ch| *ch != ',').collect();
+            match cleaned.trim().parse::<f64>() {
+                Ok(number) => Value::Float(number),
+                Err(_) => Value::String(text),
+            }
+        }
+        other => other,
+    }
+}
+
+fn convert_boolean(value: Value) -> Value {
+    let text = value.to_string();
+    if truthy_word(&text) {
+        Value::Boolean(true)
+    } else if text.is_empty() || false_word(&text) {
+        Value::Boolean(false)
+    } else {
+        value
+    }
+}
+
+fn truthy_word(text: &str) -> bool {
+    matches!(
+        text.to_ascii_lowercase().as_str(),
+        "true" | "t" | "yes" | "y" | "1" | "1.0"
+    )
+}
+
+fn false_word(text: &str) -> bool {
+    matches!(
+        text.to_ascii_lowercase().as_str(),
+        "false" | "f" | "no" | "n" | "0" | "0.0"
+    )
+}
+
+fn eval(expr: &Expr, event: &Event) -> Result<bool, RunError> {
+    Ok(match expr {
+        Expr::Truthy(inner) => match inner.as_ref() {
+            Expr::Event(field) => match event.get_field(field).map_err(event_fail)? {
+                None | Some(Value::Null) | Some(Value::Boolean(false)) => false,
+                Some(_) => true,
+            },
+            Expr::Value(Arg::String(text)) => !text.is_empty(),
+            other => eval(other, event)?,
+        },
+        Expr::Not(inner) => !eval(inner, event)?,
+        Expr::And(left, right) => eval(left, event)? && eval(right, event)?,
+        Expr::Or(left, right) => eval(left, event)? || eval(right, event)?,
+        Expr::Eq(left, right) => {
+            values_equal(&eval_value(left, event)?, &eval_value(right, event)?)
+        }
+        Expr::Neq(left, right) => {
+            !values_equal(&eval_value(left, event)?, &eval_value(right, event)?)
+        }
+        Expr::Gt(left, right) => compare(left, right, event)? == Some(std::cmp::Ordering::Greater),
+        Expr::Lt(left, right) => compare(left, right, event)? == Some(std::cmp::Ordering::Less),
+        Expr::Gte(left, right) => {
+            matches!(
+                compare(left, right, event)?,
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            )
+        }
+        Expr::Lte(left, right) => {
+            matches!(
+                compare(left, right, event)?,
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            )
+        }
+        Expr::In(left, right) => value_in(&eval_value(left, event)?, &eval_value(right, event)?),
+        Expr::RegexEq(left, right) => {
+            let text = eval_value(left, event)?.to_string();
+            let pattern = match right.as_ref() {
+                Expr::Regex(pattern) | Expr::Value(Arg::String(pattern)) => pattern.clone(),
+                other => eval_value(other, event)?.to_string(),
+            };
+            regex_match(&text, &pattern)?
+        }
+        Expr::Event(_) | Expr::Value(_) | Expr::Regex(_) => false,
+    })
+}
+
+fn eval_value(expr: &Expr, event: &Event) -> Result<Value, RunError> {
+    match expr {
+        Expr::Event(field) => Ok(event
+            .get_field(field)
+            .map_err(event_fail)?
+            .unwrap_or(Value::Null)),
+        Expr::Value(Arg::String(text)) => Ok(Value::from(text.as_str())),
+        Expr::Value(Arg::Int(number)) => Ok(Value::Integer(i128::from(*number))),
+        Expr::Value(Arg::Float(number)) => Ok(Value::Float(*number)),
+        Expr::Value(Arg::Big(text)) => Ok(Value::from(text.as_str())),
+        Expr::Value(Arg::Array(items)) => {
+            let mut values = Vec::new();
+            for item in items {
+                values.push(eval_value(&Expr::Value(item.clone()), event)?);
+            }
+            Ok(Value::Array(values))
+        }
+        other => Err(fail(format!(
+            "condition value is not supported: {}",
+            other.to_ruby()
+        ))),
+    }
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+        (Value::Integer(left), Value::Float(right)) => *left as f64 == *right,
+        (Value::Float(left), Value::Integer(right)) => *left == *right as f64,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::Null, Value::Null) => true,
+        _ => false,
+    }
+}
+
+fn compare(
+    left: &Expr,
+    right: &Expr,
+    event: &Event,
+) -> Result<Option<std::cmp::Ordering>, RunError> {
+    let left = eval_value(left, event)?;
+    let right = eval_value(right, event)?;
+    let (Some(left), Some(right)) = (as_f64(&left), as_f64(&right)) else {
+        return Ok(None);
+    };
+    Ok(left.partial_cmp(&right))
+}
+
+fn as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Integer(number) => Some(*number as f64),
+        Value::Float(number) => Some(*number),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_in(needle: &Value, haystack: &Value) -> bool {
+    match haystack {
+        Value::Array(items) => items.iter().any(|item| values_equal(item, needle)),
+        Value::String(text) => text.contains(&needle.to_string()),
+        _ => false,
+    }
+}
+
+/// `=~` for the patterns these slices compile: literals, `^`, `$`, and `.*`.
+fn regex_match(text: &str, pattern: &str) -> Result<bool, RunError> {
+    let start = pattern.starts_with('^');
+    let end = pattern.ends_with('$');
+    let body = pattern.trim_start_matches('^').trim_end_matches('$');
+    if body.contains(".*") {
+        let mut parts = body.split(".*");
+        let head = parts.next().unwrap_or("");
+        let tail = parts.next().unwrap_or("");
+        if parts.next().is_some() {
+            return Err(fail(format!(
+                "condition regex {pattern} is outside the implemented pattern subset"
+            )));
+        }
+        let head_at = if start {
+            text.starts_with(head).then_some(0)
+        } else {
+            text.find(head)
+        };
+        let Some(head_at) = head_at else {
+            return Ok(false);
+        };
+        let after = head_at + head.len();
+        return Ok(if end {
+            text[after..].ends_with(tail)
+        } else {
+            text[after..].contains(tail)
+        });
+    }
+    if body.chars().any(|ch| {
+        matches!(
+            ch,
+            '.' | '*' | '(' | ')' | '[' | ']' | '+' | '?' | '{' | '}' | '|' | '\\'
+        )
+    }) {
+        return Err(fail(format!(
+            "condition regex {pattern} is outside the implemented pattern subset"
+        )));
+    }
+    Ok(match (start, end) {
+        (true, true) => text == body,
+        (true, false) => text.starts_with(body),
+        (false, true) => text.ends_with(body),
+        (false, false) => text.contains(body),
+    })
+}
+
+fn arg<'a>(plugin: &'a Plugin, name: &str) -> Option<&'a Arg> {
+    plugin
+        .args
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}
+
+fn arg_string(plugin: &Plugin, name: &str) -> Option<String> {
+    match arg(plugin, name) {
+        Some(Arg::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn arg_i64(plugin: &Plugin, name: &str) -> Option<i64> {
+    match arg(plugin, name) {
+        Some(Arg::Int(value)) => Some(*value),
+        Some(Arg::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn arg_f64(plugin: &Plugin, name: &str) -> Option<f64> {
+    match arg(plugin, name) {
+        Some(Arg::Int(value)) => Some(*value as f64),
+        Some(Arg::Float(value)) => Some(*value),
+        Some(Arg::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn arg_text(arg: &Arg) -> Result<String, RunError> {
+    match arg {
+        Arg::String(value) => Ok(value.clone()),
+        Arg::Int(value) => Ok(value.to_string()),
+        Arg::Float(value) => Ok(value.to_string()),
+        Arg::Big(value) => Ok(value.clone()),
+        _ => Err(fail("plugin option value must be a scalar")),
+    }
+}
+
+fn key_text(key: &Key) -> String {
+    match key {
+        Key::String(value) => value.clone(),
+        Key::Int(value) => value.to_string(),
+        Key::Big(value) => value.clone(),
+        Key::Float(value) => value.to_string(),
+    }
+}
+
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".to_string())
+}
+
+/// `logstash.yml` keys this slice reads. Other keys are ignored.
+pub fn apply_logstash_yml(settings: &mut Settings, text: &str) -> Result<(), RunError> {
+    for raw in text.lines() {
+        let line = strip_yaml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            return Err(fail(format!(
+                "logstash.yml entry is not key: value: {line}"
+            )));
+        };
+        let key = key.trim();
+        let value = unquote(value.trim());
+        match key {
+            "pipeline.workers" => {
+                settings.workers = value
+                    .parse()
+                    .map_err(|_| fail(format!("pipeline.workers is not an integer: {value}")))?;
+            }
+            "pipeline.batch.size" => {
+                settings.batch_size = value
+                    .parse()
+                    .map_err(|_| fail(format!("pipeline.batch.size is not an integer: {value}")))?;
+            }
+            "pipeline.batch.delay" => {
+                let millis: u64 = value.parse().map_err(|_| {
+                    fail(format!("pipeline.batch.delay is not an integer: {value}"))
+                })?;
+                settings.batch_delay = Duration::from_millis(millis);
+            }
+            "pipeline.ecs_compatibility" => {
+                settings.ecs = match value.as_str() {
+                    "disabled" => Ecs::Disabled,
+                    "v1" => Ecs::V1,
+                    "v8" => Ecs::V8,
+                    other => {
+                        return Err(fail(format!(
+                            "pipeline.ecs_compatibility {other} is not implemented"
+                        )));
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineConfig {
+    pub id: String,
+    pub config: String,
+}
+
+/// Subset of `pipelines.yml`: a list of `pipeline.id` plus `config.string` or `path.config`.
+pub fn load_pipelines_yml(text: &str) -> Result<Vec<PipelineConfig>, RunError> {
+    let mut pipelines = Vec::new();
+    let mut current: Option<PipelineConfig> = None;
+    for raw in text.lines() {
+        let line = strip_yaml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("- ") {
+            if let Some(done) = current.take() {
+                pipelines.push(done);
+            }
+            current = Some(PipelineConfig {
+                id: String::new(),
+                config: String::new(),
+            });
+            if !rest.is_empty() {
+                assign_pipeline(current.as_mut().expect("current"), rest)?;
+            }
+        } else if let Some(pipeline) = current.as_mut() {
+            assign_pipeline(pipeline, line)?;
+        } else {
+            return Err(fail(
+                "pipelines.yml must be a list of pipeline.id entries".to_string(),
+            ));
+        }
+    }
+    if let Some(done) = current {
+        pipelines.push(done);
+    }
+    if pipelines.is_empty() {
+        return Err(fail("pipelines.yml has no pipelines"));
+    }
+    for pipeline in &pipelines {
+        if pipeline.id.is_empty() || pipeline.config.is_empty() {
+            return Err(fail(
+                "each pipelines.yml entry needs pipeline.id and config.string or path.config",
+            ));
+        }
+    }
+    Ok(pipelines)
+}
+
+fn assign_pipeline(pipeline: &mut PipelineConfig, line: &str) -> Result<(), RunError> {
+    let Some((key, value)) = line.split_once(':') else {
+        return Err(fail(format!(
+            "pipelines.yml entry is not key: value: {line}"
+        )));
+    };
+    let value = unquote(value.trim());
+    match key.trim() {
+        "pipeline.id" => pipeline.id = value,
+        "config.string" => pipeline.config = value,
+        "path.config" => {
+            pipeline.config = std::fs::read_to_string(&value)
+                .map_err(|error| fail(format!("cannot read path.config {value}: {error}")))?;
+        }
+        other => {
+            return Err(fail(format!(
+                "pipelines.yml key {other} is not implemented"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn strip_yaml_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn unquote(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+struct Queue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+struct QueueState {
+    items: VecDeque<Event>,
+    inputs_alive: usize,
+}
+
+impl Queue {
+    fn new(inputs: usize) -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                items: VecDeque::new(),
+                inputs_alive: inputs,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn push(&self, event: Event) {
+        let mut state = self.state.lock().expect("queue");
+        state.items.push_back(event);
+        self.ready.notify_all();
+    }
+
+    fn close_input(&self) {
+        let mut state = self.state.lock().expect("queue");
+        state.inputs_alive = state.inputs_alive.saturating_sub(1);
+        self.ready.notify_all();
+    }
+
+    fn read_batch(&self, batch_size: usize, delay: Duration) -> Option<Vec<Event>> {
+        let mut state = self.state.lock().expect("queue");
+        let mut waited = Duration::ZERO;
+        let started = Instant::now();
+        loop {
+            if state.items.len() >= batch_size {
+                return Some(drain(&mut state, batch_size));
+            }
+            if state.inputs_alive == 0 {
+                if state.items.is_empty() {
+                    return None;
+                }
+                return Some(drain(&mut state, batch_size));
+            }
+            let timeout = if state.items.is_empty() {
+                Duration::from_secs(30)
+            } else {
+                delay.saturating_sub(waited)
+            };
+            let (next, status) = self.ready.wait_timeout(state, timeout).expect("queue wait");
+            state = next;
+            waited = started.elapsed();
+            if status.timed_out() && !state.items.is_empty() {
+                return Some(drain(&mut state, batch_size));
+            }
+        }
+    }
+}
+
+fn drain(state: &mut QueueState, batch_size: usize) -> Vec<Event> {
+    let count = state.items.len().min(batch_size);
+    state.items.drain(..count).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yaml_subset_reads_workers_and_two_pipelines() {
+        let mut settings = Settings::default();
+        apply_logstash_yml(
+            &mut settings,
+            "pipeline.workers: 2\npipeline.batch.size: 10\npipeline.ecs_compatibility: disabled\n",
+        )
+        .expect("yml");
+        assert_eq!(settings.workers, 2);
+        assert_eq!(settings.batch_size, 10);
+        assert_eq!(settings.ecs, Ecs::Disabled);
+        let pipelines = load_pipelines_yml(
+            "- pipeline.id: alpha\n  config.string: input { generator { count => 1 } }\n- pipeline.id: beta\n  config.string: input { generator { count => 1 } }\n",
+        )
+        .expect("pipelines");
+        assert_eq!(pipelines.len(), 2);
+        assert_eq!(pipelines[0].id, "alpha");
+        assert_eq!(pipelines[1].id, "beta");
+    }
+
+    #[test]
+    fn line_codec_emits_complete_lines_and_keeps_the_tail() {
+        let codec = CodecSpec {
+            name: "line".to_string(),
+            delimiter: "\n".to_string(),
+            format: None,
+        };
+        let mut pending = String::new();
+        let lines = codec_decode(&codec, &mut pending, "one\ntwo").expect("decode");
+        assert_eq!(lines, vec!["one".to_string()]);
+        assert_eq!(pending, "two");
+    }
+}

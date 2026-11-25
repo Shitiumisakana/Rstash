@@ -7,6 +7,7 @@
 mod model;
 mod parse;
 
+pub(crate) use model::{Arg, Expr, Key, Kind, Plugin, Statement};
 pub use model::{CompiledPlugin, ConfigError, Pipeline, PipelineVertex, SourceMeta};
 
 /// One `SourceWithMetadata` passed to `ConfigCompiler.compileSources`.

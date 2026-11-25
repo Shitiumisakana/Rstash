@@ -2,13 +2,13 @@
 
 - 形态：兼容重实现。交付物是纯 Rust 源码和一个 Rust 二进制。进程里没有 JVM、没有 JRuby、没有 Ruby 解释器，也不去调用 `java`。
 - 主案例：Rspack。
-- 当前切片：第 5 片还没开始。先用 Elastic v9.5.2 的官方测例复核了第 1 到第 4 片。下一位做第 5 片，内存管道，验收 `cargo test pipeline_generator_stdout`。不要重写事件模型和 LSCL 编译器。
+- 当前切片：第 5 到第 8 片已通过。下一位从波 A 开始（stdin、dots、sink、uuid）。不要重写事件模型、LSCL 编译器，也不要重写已经能跑的内存管道。
 - 上一片：第 2 到第 4 片一起验收。命令 `cargo test` 覆盖 event_fields、parse_sections、conditions、compile_graph。日期 2026-11-25。后又加了 `cargo test --test official`。
 - 官方测试：发行包里没有 JUnit / RSpec。源在 `elastic/logstash` tag `v9.5.2`，本机副本在 `target/upstream/logstash`（已 gitignore）。这些测试构造的是 `org.logstash.Event` 和 JRuby，不能直接对 `rstash` 执行。对照方式是把同一批配置和断言喂给 Rust，编译期望值由 9.5.2 的 `compile_imperative` 打到 `tests/fixtures/oracle/official_compiler.txt`。
 - `compiler_spec.rb` 和 `config_ast_spec.rb` 里能落到 LSCL 的配置共 83 条，期望值是 9.5.2 `compile_imperative` 的图文本。另外按原断言核对了语句上的 source 协议、id、行号、列号和插件原文，`config.support_escapes` 打开时参数值是处理后的字符串。`010` 按 Ruby `Integer()` 是八进制 8。
 - 事件、字段、sprintf 的官方断言已改写成 `cargo test --test official_suite`。覆盖 `EventTest`、`event_spec.rb`、`FieldReferenceTest`、`StringInterpolationTest`、`string_escape_spec.rb` 里的可观察行为：`toJson` / `fromJson`、数组下标（含负数）、`tag`、`append`、`toString`、字段转义 `none` / `percent` / `ampersand`、`%{{YYYY-DDD}}`、`%{{YYYY-'W'ww}}`、`%{+%ss}`。
 - `ConfigCompilerTest`：空源和整段注释不产生插件，多段配置按顺序合并，`originalSource` 用换行拼起来。原文非空白时 `uniqueHash` 是这段原文的 SHA-256；原文缺失或只有空白时，用 `Graph#uniqueHash`：各插件和 if 的 `id|protocol|line|column|text` 先各自 SHA-256，排序拼接后再 SHA-256，queue 和 separator 不参与。`complex.cfg` 和 `spec/support/lscl_configs` 下 6 个文件能编过。`PipelineIR` 在 input 和 filter 之间放一个 queue，queue 后面不再有第二个 queue。
-- 不在前四片里、因此没有跑：CBOR 字节、JRuby 代理对象身份、字段引用缓存上限、`estimateMemory`、Ruby `NoMethodError`、`CompiledPipelineTest`、`EventConditionTest`。
+- 不在前四片里、因此没有跑：CBOR 字节、JRuby 代理对象身份、`estimateMemory`、Ruby `NoMethodError`、`CompiledPipelineTest`、`EventConditionTest`。字段引用缓存上限、内存里的精确小数、`from_json` 工厂闭包、没有原文时的 `Graph#uniqueHash` 已在 `a1a712d` 按原效果补上。
 - 运行时只有 Rust，不嵌入 Java / Ruby，Cargo 只用纯 Rust crate。做不到时停下来问，不要为了编译去链 C 或启动 JVM。
 - 预言机：Logstash 9.5.2。发行包 JDK 是 Linux，在 WSL 里跑。管道输出在 `tests/fixtures/oracle/event_fields.out`，直接调用 `org.logstash.Event` / `Timestamp` 的输出在 `tests/fixtures/oracle/event_probe.out`。LSCL 编译结果在 `tests/fixtures/oracle/lscl_compile.txt`，由发行包里的 JRuby 调用 `LogStash::Compiler.compile_imperative` 打出来。命令写在这些文件头上。
 - 下一位只做本文件切片表里的下一片。不要从已经通过的切片重新翻译。
@@ -93,10 +93,10 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - 第 2 片。LSCL 子集：注释、三段式、插件、属性、字符串、数字、数组、哈希。验收：`cargo test parse_sections`。状态：通过。语法按 `lscl_grammar.treetop` 的顺序做递归下降。`config.support_escapes` 默认 false，引号里的反斜杠原样保留；为 true 时才走 `StringEscape.process_escapes`。没有 `true` / `false` / `null` 关键字，两个字符以上的裸词是字符串。裸词至少两个字符，哈希键一个字母会报 treetop 那种 `Expected [A-Za-z0-9_]`。数字末尾只有点（`1.`）语法上能读出来，随后按 Ruby `Float()` 报 `ArgumentError`。整数走 Ruby `Integer()`：前导 0 是八进制，`010` 是 8，`08` 和 `09` 报 `ArgumentError`。重复属性：标量不同变成数组，相同保留一个；数组拼接；哈希按 `hash_merge_with_dups` 合并。哈希字面量里的重复键报 `Duplicate keys found`。input/output 上 `codec` 的值如果变成数组（写了两次，或写成 `codec => ["json"]`）报 multiple codec。插件值（例如 `codec => json { }`）的类型是 codec。
 - 第 3 片。条件：`if/else/elsif`、比较、`in`、`=~`、`and/or/xor/nand`。验收：`cargo test conditions`。状态：通过。`elsif` 不是关键字，`else if` 和连写的 `elseif` 才会变成嵌套 if。布尔运算是 `Condition#join_conditions`：`and` 优先级 2，`or` 优先级 1，只有左边优先级严格更高才弹出，所以同级是右结合。单独的 `nand` 是 `!(left && right)`，单独的 `xor` 是 `(!(left) && right) || (left && !(right))`；它们和别的布尔运算混用就报错。`=~` 右边的字符串会变成正则。方法调用没有实现，`length([aa])` 会退化成字段 `[aa]`，这是 9.5.2 的实际行为，不要改成报错。
 - 第 4 片。编译成执行图：filter 顺序、input/output 并列、if 分支。验收：`cargo test compile_graph`。状态：通过。空段是 noop；只有一个语句时不包一层；多个 filter 是 `do-sequence`，多个 input 或 output 是 `composed-parallel`。if 的空分支也是 noop。语句文本按 Java `toString` 的缩进来，方便和预言机逐字比较。插件参数里再嵌一个插件时，JRuby 的 `Hash#inspect` 会带上变化的对象 id，预言机改成按 `PluginDefinition` 打印，Rust 也按这个稳定形状输出。
-- 第 5 片。内存管道跑通一条最小配置：`generator` count + `stdout`。批大小、delay、worker 数按默认值。验收：`cargo test pipeline_generator_stdout`。状态：未开始。不要在这一片重写解析器。
-- 第 6 片。CLI：`-e`、`-f`、`-t`（配置对则退出 0，错则非 0）、`-w`、`-b`。验收：`cargo test cli_test_and_exit`。状态：未开始。
-- 第 7 片。内置 codec `plain`/`line` 和过滤器 `drop`，加上 `mutate` 的 add/remove/rename/convert 里 fixture 覆盖到的子集。验收：对应 `cargo test`。状态：未开始。
-- 第 8 片。`logstash.yml` 子集和 `pipelines.yml` 多管道（仍是内存队列）。验收：两条管道的事件互不串。状态：未开始。
+- 第 5 片。内存管道跑通一条最小配置：`generator` count + `stdout`。批大小 125、delay 50 ms、worker 数等于 CPU。验收：`cargo test pipeline_generator_stdout`。状态：通过。没有重写解析器。`generator` 的 `count` 必须大于 0；0 表示无限生成，这条管道不会一直跑。ECS 默认 `v8`，字段走 v1：`[host][name]`、`[event][sequence]`、`[event][original]`。`stdout` 不写默认的 `rubydebug`，配置里要显式 `codec => plain` 或 `codec => line`，否则报未实现并退出。
+- 第 6 片。CLI：`-e`、`-f`、`-t`（配置对则打印 `Configuration OK` 并退出 0，错则非 0）、`-w`、`-b`，另外认 `--path.settings`。验收：`cargo test cli_test_and_exit`。状态：通过。没实现的插件在 `-t` 和正式运行时都是非 0。
+- 第 7 片。内置 codec `plain`/`line` 和过滤器 `drop`，加上 `mutate` 的 add/remove/rename/convert。验收：`cargo test drop_mutate_and_line_codec`。状态：通过。`drop` 的 percentage 100 一定取消事件，0 不取消。`mutate` 的顺序是 rename、convert，然后 add_field、remove_field。`line` 只在遇到分隔符时吐出完整行，剩余部分留到 flush，flush 出来的事件没有 sequence。`=~` 只执行字面量、`^`、`$` 和一段 `.*`。
+- 第 8 片。`logstash.yml` 子集（`pipeline.workers`、`pipeline.batch.size`、`pipeline.batch.delay`、`pipeline.ecs_compatibility`）和 `pipelines.yml`（`pipeline.id` 加 `config.string` 或 `path.config`）。验收：`cargo test pipelines_do_not_mix_events`。状态：通过。每条管道单独一条内存队列，命令行给了 `-e` 或 `-f` 时不读 `pipelines.yml`。
 
 第 5 片通过之后才进入插件波次。每一波仍是一片一片做，每片用旧 `bin/logstash` 的 stdout 或退出码验收。
 
@@ -111,9 +111,9 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## 插件清单
 
-已对齐：无。
+已对齐：`generator`（有限 count，ECS v8/v1 与 disabled）、`stdout`（codec 只能是 `plain` 或 `line`）、`plain`、`line`、`drop`、`mutate` 的 add_field / remove_field / rename / convert。
 
-未实现（出现在配置里必须报错，当前切片还没有配置加载器，这条从第 5 片起生效）：发行包 Gemfile 中的全部插件，以及核心自带的 stdin、generator、uuid、stdout、sink、plain、line、dots、pipeline。
+未实现（出现在配置里必须报错并退出非 0）：发行包 Gemfile 中的全部插件，以及核心自带的 stdin、uuid、sink、dots、pipeline、rubydebug。`generator` 的 `message => "stdin"`、`mutate` 的其余选项、input 段里的 `if` 也报未实现，不猜。
 
 ## 不做
 
@@ -127,4 +127,4 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## Git
 
-远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。`origin/master` 目前是 `bf7bf61`。这次官方测例复核和八进制修正还在本地，没有提交。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
+远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `a1a712d`。第 5 到第 8 片在这次提交里。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
