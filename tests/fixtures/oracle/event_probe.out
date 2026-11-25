@@ -1,0 +1,24 @@
+# logstash 9.5.2
+# date: 2026-11-25
+# command: java -cp logstash-core/lib/jars/*:joda-time-2.12.7.jar:vendor/jruby/lib/jruby.jar Probe
+# note: direct calls to org.logstash.Timestamp and org.logstash.Event from the 9.5.2 jars, run with the bundled Linux JDK under WSL.
+TS 2023-11-14T22:13:20Z => 2023-11-14T22:13:20.000Z
+TS 2023-11-14T22:13:20.280581100Z => 2023-11-14T22:13:20.280581100Z
+TS 2023-11-14T22:13:20.280Z => 2023-11-14T22:13:20.280Z
+TS 2023-11-14T22:13:20.280581Z => 2023-11-14T22:13:20.280581Z
+TS 2023-11-14T22:13:20.000001Z => 2023-11-14T22:13:20.000001Z
+SPRINTF_NESTED=nested
+SPRINTF_META=filebeat
+SPRINTF_MISS=%{[no][such]}
+SPRINTF_DAY=2026.11.25
+SPRINTF_EPOCH=1795588275
+SPRINTF_JAVA=2026-11-25
+SPRINTF_MSG=hello 😀
+SPRINTF_PREFIX=x nested y
+SPRINTF_PAIR={"a":"2","z":"1"}
+OVERWRITE_SCALAR=org.logstash.Accessors$InvalidFieldSetException Could not set field 'child' on object 'top' to value 'x'.This is probably due to trying to set a field like [foo][bar] = someValuewhen [foo] is not either a map or a string
+INVALID_SET=org.logstash.FieldReference$IllegalSyntaxException Invalid FieldReference: `foo[bar]`
+REMOVE_MISSING=null
+SPRINTF_NO_TS=
+SPRINTF_NO_EPOCH=
+FIXED_TIMESTAMP=2026-11-25T06:31:15.280581100Z

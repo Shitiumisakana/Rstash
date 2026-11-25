@@ -1,0 +1,5 @@
+# logstash 9.5.2
+# date: 2026-11-25
+# command: wsl bash /mnt/d/code/logstash-9.5.2/bin/logstash -f /mnt/d/code/Rstash/tests/fixtures/oracle/event_fields.conf --path.data /mnt/d/code/Rstash/target/oracle-data --path.logs /mnt/d/code/Rstash/target/oracle-logs --log.level error --api.enabled false -w 1 -S allow_superuser=true
+# note: bundled JDK is Linux, so this ran in WSL. allow_superuser=true because that user is root. path.data and path.logs were outside the Logstash install.
+{"copied":"nested","tags_join":"alpha,beta,nested","message":"hello 😀","plain":"top","tags":["alpha","beta","nested"],"event":{"original":"hello 😀","sequence":0},"java_day":"2026-11-25","foo_json":"{\"bar\":\"nested\"}","host":{"name":"DESKTOP-GJ60SU4"},"@version":"1","epoch":"1795588569","msg_copy":"hello 😀","missing":"%{[no][such]}","quoted":"say \\\"hi\\\"","day":"2026.11.25","deep":{"a":{}},"@timestamp":"2026-11-25T06:36:09.205270900Z","foo":{"bar":"nested"},"slash":"a\\\\b","meta_copy":"filebeat"}

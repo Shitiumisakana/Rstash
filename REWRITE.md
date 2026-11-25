@@ -1,0 +1,124 @@
+# 重写计划
+
+- 形态：兼容重实现。交付物是纯 Rust 源码和一个 Rust 二进制。进程里没有 JVM、没有 JRuby、没有 Ruby 解释器，也不去调用 `java`。
+- 主案例：Rspack。
+- 当前切片：第 1 片已通过。下一位做第 2 片，LSCL 解析，验收 `cargo test parse_sections`。不要重写事件模型。
+- 上一片：第 1 片。验收命令 `cargo test event_fields`。结果：4 passed，0 failed。日期 2026-11-25。同一次还跑了 `cargo fmt` 和 `cargo clippy --all-targets -- -D warnings`，通过。
+- 运行时只有 Rust，不嵌入 Java / Ruby，Cargo 只用纯 Rust crate。做不到时停下来问，不要为了编译去链 C 或启动 JVM。
+- 预言机：Logstash 9.5.2。发行包 JDK 是 Linux，在 WSL 里跑。管道输出在 `tests/fixtures/oracle/event_fields.out`，直接调用 `org.logstash.Event` / `Timestamp` 的输出在 `tests/fixtures/oracle/event_probe.out`。命令写在这两个文件头上。
+- 下一位只做本文件切片表里的下一片。不要从已经通过的切片重新翻译。
+
+进度回复固定包含：当前切片、验收命令、通过还是失败、下一块是什么。
+
+Logstash 9.5.2 是一个常驻进程：读 pipeline 配置，输入插件写事件，队列攒批，过滤插件按顺序改事件，输出插件把事件送走。人通过 `bin/logstash` 启动它，状态在 `path.data`（持久队列、死信队列、节点 uuid、密钥库）。
+
+本机 `D:\code\logstash-9.5.2` 是发行包，不是 Elastic 的 git 树：没有 `src/main/java`，没有单元测试。Java 在 `logstash-core\lib\jars\logstash-core.jar`，编排在 `logstash-core\lib\logstash`。预言机就是这个能跑的旧进程。类级细节需要时对照上游 tag `v9.5.2` 的公开源码，期望值仍从本机二进制跑出来，禁止用新实现的输出回填测试。
+
+旧进程只在开发时当对照，不链接进 `rstash`。用户跑 Rstash 时不需要安装 JDK。
+
+- 照搬：
+  1. 边界行为用 Rust 重新实现：仍读原来的 `.conf`，仍认原来的 CLI 参数，仍写出原来的事件 JSON，退出码仍对齐。这些解析和执行全是 Rust 结构体和 enum。不把 Java 类留下来，也不把 Java 类层次翻译成 trait 继承树。
+  2. 插件分清单，每一项都是 Rust 实现。没实现的插件明确报错并退出，不静默跳过，也不退回 Ruby gem。清单随切片更新。
+  3. JSON、时间、YAML、HTTP 用纯 Rust crate。配置语法是产品，对照 `logstash-core\lib\logstash\compiler\lscl\lscl_grammar.treetop` 用 Rust 重写解析器。treetop 文件只当规格读，不打进程序。
+- 不照搬：不留任何第二种语言运行时。旧的 `.rb` 和 `.java` 插件都按行为用 Rust 重写。
+- 源语言和构建：Java 21 + JRuby 10.0.6.0。上游是 Gradle（核心）和 Rake/Bundler（gem）。运行时入口是 `bin/logstash` → `org.logstash.Logstash` → `LogStash::Runner` → `LogStash::Agent`。
+- 公开表面：CLI 标志（`-e`、`-f`、`-t`、`-w`、`-b`、`--path.settings`、`--path.data`、API 端口）；LSCL 配置；事件字段 `@timestamp`、`@version`、`tags`、`[@metadata]`、`%{sprintf}`；`logstash.yml` / `pipelines.yml`；内存队列、持久队列、死信队列的可观察行为；监控 API 路径；`logstash-plugin`、`pqcheck`、`pqrepair`、`logstash-keystore`。
+- 预言机：`D:\code\logstash-9.5.2\bin\logstash.bat`。发行包里没有 JUnit / RSpec。
+
+管道在数据面上的角色固定为 input → queue → filter → output。配置语言不换成另一种 DSL。
+
+## 语言边界
+
+Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（典型信号是依赖 `cc`、`cmake` 或 `bindgen`）。操作系统接口（Windows API）不算第二种业务语言。
+
+某一片如果只有 C 绑定才能对齐行为，开工前停下来问。默认继续找纯 Rust 实现。已知会碰到这个选择的地方：
+
+- Grok 的正则方言来自 Oniguruma。优先纯 Rust 正则；对不齐的模式记入有意差异，不默认链接 C 库。
+- Kafka 客户端优先纯 Rust 实现，不用 librdkafka。
+- `logstash-keystore` 的 JCEKS 文件优先纯 Rust 读取。读不了就停下来问，不在 Rust 进程里启动 JVM。
+
+## 它有哪些模块
+
+- 进程入口。`bin/logstash` 拉起 JVM，再进入 Ruby CLI。旁边还有 `logstash-plugin`、`logstash-keystore`、`pqcheck`、`pqrepair`。这些是公开命令，晚于管道核心。
+- Agent。`logstash-core/lib/logstash/agent.rb` 管多管道、热加载、信号和监控 HTTP。控制面，不进第一片。
+- 配置语言 LSCL。Treetop 语法约 247 行：`input` / `filter` / `output`、插件属性、`if/else/elsif`、比较、`in`、`=~`、`and/or/xor/nand`。`config/grammar.treetop` 是遗留 AST，执行走 LSCL。
+- 编译。Ruby 把语法树交给 `org.logstash.config.ir.ConfigCompiler`，得到 `PipelineIR`。`CompiledPipeline` 再交给 worker。
+- 执行。`JavaPipeline` 为每个 input 起线程，按 `pipeline.workers` 起 `WorkerLoop`。默认 batch 125、delay 50ms、workers 等于 CPU 数、`queue.type` 为 `memory`、`pipeline.ordered` 为 `auto`。
+- 事件。`org.logstash.Event`：开放字段表、独立的 `@metadata`、`@timestamp`、`tags`、`sprintf`、`cancel`。这是后面每一片的叶子。
+- 队列。内存队列是批读取。持久队列是 `org.logstash.ackedqueue` 的 mmap 页（V1/V2）加 checkpoint，路径 `path.data/queue/<pipeline_id>/`。死信队列是另一套分段文件。
+- 插件契约。Java：`co.elastic.logstash.api` 的 Input / Filter / Output / Codec。Ruby：`LogStash::Inputs::Base` 等。发现方式是 gem 元数据 `logstash_plugin: true`。核心 JAR 自带 stdin、generator、uuid、stdout、sink、plain、line、dots。Ruby 自带 `pipeline` 输入输出。其余在发行包 `Gemfile` 里。
+- 设置。`environment.rb` 登记默认值，`logstash.yml` 和 CLI 覆盖。
+- 可观测性。默认 `127.0.0.1:9600` 起。路径包括 `/`、`/_node`、`/_node/stats`、`/_node/hot_threads`、`/_stats`、`/_health_report`。
+- x-pack。集中配置、内部监控管道、GeoIP 库下载、许可证。不在管道能跑通之前做。
+
+## 技术栈替换
+
+替换的是运行时角色。组合根只在二进制的 `main`。第一片只有一个 crate `rstash`，二进制同名。出现「测试不想启动管道」时再拆领域 crate。管道线程模型保持阻塞。tokio 等到某个插件确实要异步 IO 再引入。
+
+- JRuby 启动和 `LogStash::Runner`：Rust `main` 手写组装。CLI 用 clap，标志与旧进程对齐。切片 6。
+- Treetop LSCL：手写递归下降，规则对照 treetop。不引入 Ruby。切片 2–3。
+- `ConfigCompiler` / `CompiledPipeline`：enum 图（插件、if、队列边界）。切片 4。
+- `WorkerLoop`、input 线程、内存队列：`std::thread` 加带超时的批队列。默认 125 / 50ms / CPU 数要锁住。切片 5。
+- `org.logstash.Event`、`FieldReference`、`sprintf`：结构体。`@metadata` 与正文字段分开。切片 1。Java 字符串若按 UTF-16 下标切片才需要码元索引；本片字段路径按字符，不用下标截断。`@timestamp` 是带时区的时刻，不把本地时间当成 UTC。
+- 事件 JSON（json / json_lines codec）：serde。事件是开放 map，不要 `deny_unknown_fields`。`@timestamp` 的字符串格式用 fixture 锁。切片 5 之后的 codec 片。
+- Ruby 插件基类和 gem 发现：Rust trait，注册表里是编译进二进制的 Rust 插件。不扫描 gem，不执行 `.rb`。未注册名字启动失败。
+- Log4j：`tracing`。日志句子不是契约。
+- 内存队列：标准库。持久队列：`memmap2`，页格式对照旧文件和 `pqcheck`。死信队列同理。靠后的切片。
+- `logstash.yml`：serde_yaml 收成一个结构体，在 `main` 加载一次。密钥只来自环境变量或现有 keystore 文件，不写进仓库。
+- 监控 API：axum，路径和 JSON 字段用旧响应 fixture 锁。JVM 段在 Rust 进程里没有对应物，做这一片之前停下来确认，未确认不实现。
+- Elasticsearch / Kafka / JDBC：用纯 Rust 客户端说原来的协议。各算一片插件。
+- Grok：行为用 fixture 锁。正则库必须是纯 Rust。对不齐的 Oniguruma 语法记入有意差异，开工前问。
+- GeoIP：用纯 Rust 的 MaxMind 读取库。下载器属于 x-pack，更晚。
+- Java KeyStore：文件格式仍是公开表面，用纯 Rust 读写。做不到就停下来问，不启动 JVM，也不自研密码学。
+
+## 有意差异
+
+- 未实现的插件。旧：加载 gem 并运行。新：打印插件类型和名字，非 0 退出。原因：按波次补齐，禁止假装成功。已确认：先做管道，再迭代到完整。终态要消掉这条。
+- 进程里不保留 Java、JRuby、Ruby。旧：插件是 `.java` / `.rb`，宿主是 JVM。新：同一行为由 Rust 实现，二进制不嵌入第二种语言。已确认。
+- 日志原文和异常类名。旧：Log4j / Ruby 异常。新：`tracing` 和 `Result`。原因：没有采集规则依赖原文。
+- 二进制名。旧命令是 `logstash`。新二进制叫 `rstash`，参数对齐。原因：仓库名是 Rstash。
+- 监控 API 里的 JVM 堆、GC、hot threads。旧 JSON 有 JVM 字段。新进程没有 JVM。未确认。实现 `/_node/stats` 之前必须问，未确认不实现。
+
+## 切片
+
+依赖只指向已经通过的叶子。一轮只实现一片。
+
+- 第 1 片。事件、字段路径、`sprintf`、`@metadata`、`tags`、`@timestamp`。验收：`cargo test event_fields`。不引入 tokio、axum、clap。状态：通过。`@timestamp` 文本与 9.5.2 一致：纳秒为 0 时固定 3 位小数，否则按 3/6/9 位去掉末尾的零组。`%{+pattern}` 用 Joda 风格，目前只实现 `y` `Y` `M` `d` 和字面字符；`%{+%s}` 是 epoch 秒；`%{{pattern}}` 用同一套字母、不截断到毫秒。没实现的字母返回错误，不猜。字段路径按 Unicode 标量扫描，预言机里的路径都是 ASCII。
+- 第 2 片。LSCL 子集：注释、三段式、插件、属性、字符串、数字、数组、哈希。验收：`cargo test parse_sections`。状态：未开始。
+- 第 3 片。条件：`if/else/elsif`、比较、`in`、`=~`、`and/or/xor/nand`。验收：`cargo test conditions`。状态：未开始。
+- 第 4 片。编译成执行图：filter 顺序、input/output 并列、if 分支。验收：`cargo test compile_graph`。状态：未开始。
+- 第 5 片。内存管道跑通一条最小配置：`generator` count + `stdout`。批大小、delay、worker 数按默认值。验收：`cargo test pipeline_generator_stdout`。状态：未开始。
+- 第 6 片。CLI：`-e`、`-f`、`-t`（配置对则退出 0，错则非 0）、`-w`、`-b`。验收：`cargo test cli_test_and_exit`。状态：未开始。
+- 第 7 片。内置 codec `plain`/`line` 和过滤器 `drop`，加上 `mutate` 的 add/remove/rename/convert 里 fixture 覆盖到的子集。验收：对应 `cargo test`。状态：未开始。
+- 第 8 片。`logstash.yml` 子集和 `pipelines.yml` 多管道（仍是内存队列）。验收：两条管道的事件互不串。状态：未开始。
+
+第 5 片通过之后才进入插件波次。每一波仍是一片一片做，每片用旧 `bin/logstash` 的 stdout 或退出码验收。
+
+- 波 A：stdin、dots、sink、uuid。
+- 波 B：date、json、kv、dissect、csv、grok、clone、fingerprint、prune。
+- 波 C：json、json_lines、rubydebug、multiline codec。
+- 波 D：file、tcp、udp、http、beats。file 的 sincedb 在插件里，不在 core。
+- 波 E：持久队列页格式和 `pqcheck`/`pqrepair`，然后死信队列。已有 `path.data/queue` 的用户要能接着读，格式以 9.5.2 落盘字节为准。
+- 波 F：elasticsearch、kafka、jdbc 的协议行为。
+- 波 G：监控 API（先确认 JVM 段）、热加载、`pipeline` 输入输出。
+- 波 H：plugin 子命令、keystore、x-pack。Gemfile 里其余插件按这个顺序继续，直到清单清空。
+
+## 插件清单
+
+已对齐：无。
+
+未实现（出现在配置里必须报错，当前切片还没有配置加载器，这条从第 5 片起生效）：发行包 Gemfile 中的全部插件，以及核心自带的 stdin、generator、uuid、stdout、sink、plain、line、dots、pipeline。
+
+## 不做
+
+- 不在 Rstash 里保留、嵌入或调用 Java、JRuby、Ruby、Python。
+- 不把会编译 C 或 C++ 的 crate 写进 `Cargo.toml`。某一片做不到纯 Rust 时先问，不自行加 C 依赖。
+- 不按 Java 包建一排空 crate，不写 DI 容器或注解扫描。
+- 不在第 1 片引入 tokio、axum、clap。
+- 不把持久队列、监控 API、x-pack 提前做完。
+- 不修改旧 Logstash 目录里的任何文件。旧目录只在开发时当对照。跑预言机时 `--path.data` 和 `--path.logs` 指向本仓库 `target/`，避免写入发行包。
+- 发现旧行为像 bug 时记入有意差异，未确认不改。
+
+## Git
+
+远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
