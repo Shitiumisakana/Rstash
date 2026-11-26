@@ -2,7 +2,7 @@
 
 - 形态：兼容重实现。交付物是纯 Rust 源码和一个 Rust 二进制。进程里没有 JVM、没有 JRuby、没有 Ruby 解释器，也不去调用 `java`。
 - 主案例：Rspack。
-- 当前切片：第 5 到第 8 片已通过。波 A 到波 C 已通过（波 B 里除 grok 以外的过滤器仍是各自 gem 的一部分选项）。波 D 的 file sincedb 已按插件格式读写。下一位继续波 D 的 tcp、udp、http、beats。不要重写事件模型、LSCL 编译器，也不要重写已经能跑的内存管道。
+- 当前切片：第 5 到第 8 片已通过。波 A 到波 C 已通过（波 B 里除 grok 以外的过滤器仍是各自 gem 的一部分选项）。波 D 的 file sincedb，以及 tcp、udp、http、beats 的明文协议已通过。下一位做波 E：持久队列页格式。不要重写事件模型、LSCL 编译器，也不要重写已经能跑的内存管道。
 - 上一片：第 2 到第 4 片一起验收。命令 `cargo test` 覆盖 event_fields、parse_sections、conditions、compile_graph。日期 2026-11-25。后又加了 `cargo test --test official`。
 - 官方测试：发行包里没有 JUnit / RSpec。源在 `elastic/logstash` tag `v9.5.2`，本机副本在 `target/upstream/logstash`（已 gitignore）。这些测试构造的是 `org.logstash.Event` 和 JRuby，不能直接对 `rstash` 执行。对照方式是把同一批配置和断言喂给 Rust，编译期望值由 9.5.2 的 `compile_imperative` 打到 `tests/fixtures/oracle/official_compiler.txt`。
 - `compiler_spec.rb` 和 `config_ast_spec.rb` 里能落到 LSCL 的配置共 83 条，期望值是 9.5.2 `compile_imperative` 的图文本。另外按原断言核对了语句上的 source 协议、id、行号、列号和插件原文，`config.support_escapes` 打开时参数值是处理后的字符串。`010` 按 Ruby `Integer()` 是八进制 8。
@@ -88,6 +88,7 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - grok 的 `timeout_millis` 不打断匹配。旧实现用 Ruby `Timeout`。新实现把正则跑完。原因：没有单独的超时线程；跑不完的模式会一直占着这次调用。
 - `multiline` 的 `auto_flush_interval` 不是后台计时器。有限的 `file` 输入在结束时 flush；`stdin` 不 flush。`charset` 只认 `UTF-8`。
 - file 的 tail 读完当前新增内容就返回，不会一直盯着文件。旧进程在 `subscribe` 里停住，直到收到停止信号。这里还没有停止信号。
+- tcp、udp、http、beats 的监听在对端关掉、端口空闲之后返回。旧进程停在 `stop?` 上。这里还没有停止信号。`ssl_enabled => true` 直接报未实现，不链接 TLS。tcp 输入不做反向 DNS，`host` 写的是对端数字地址。beats 只收 lumberjack v2 的窗口帧和 JSON 帧，压缩帧报未实现。tcp 输出只做 client。http 输出只做 `format => json` 和 `message`。
 
 ## 切片
 
@@ -107,7 +108,7 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - 波 A：stdin、dots、sink、uuid。状态：通过。验收 `cargo test --test waves`。`stdin` 默认按行读，`Settings.stdin` 有值时用那一段文本，否则读到 EOF。`dots` 每个事件编码成一个 `.`，不能解码。`sink` 丢掉输出字节，事件仍记在运行结果里。`uuid` 要 `target`；`overwrite` 默认 false，写出的是版本 4 的十六进制字符串。
 - 波 B：date、json、kv、dissect、csv、grok、clone、fingerprint、prune。状态：grok 通过，其余过滤器仍是各自 gem 的一部分选项。`grok` 4.4.4：`%{NAME}`、`%{NAME:字段}`、`%{NAME:字段:int}`、`%{NAME:字段:float}`、`pattern_definitions`、`patterns_dir`、`break_on_match`、`named_captures_only`、`keep_empty_captures`、`overwrite`、`target`、`tag_on_failure`。ECS `v8`/`v1` 用 `patterns/ecs-v1`，`disabled` 用 `patterns/legacy`，内容是 patterns-core 4.3.4。每一条内置模式都能编过。`timeout_millis` 收下但不打断匹配。JRuby 会把嵌套的 `?*` 收成 `*`，这里同样收成 `*`。`date` 认 `UNIX`、`UNIX_MS`、`ISO8601` 和一段 Joda 字母（`y M d H m s S`）。`json` 解析失败打 `_jsonparsefailure`。`kv` 用字面量 `field_split` / `value_split`。`dissect` 认普通字段、`?` 跳过、`+` 拼接、`&` 间接字段。`csv` 认 `columns`、`separator`、`convert` 的 integer/float/boolean。`clone` 在 ECS 关闭时写 `type`，打开时加 tag，原事件保留。`fingerprint` 的 `SHA1`、`SHA256`、`UUID`、`PUNCTUATION` 可用，其它方法报未实现。`prune` 只处理顶层字段名。同一批还接上了 `split`、`urldecode`、`truncate`、`syslog_pri`、`de_dot`、`anonymize`（HMAC-SHA1 / HMAC-SHA256）、`sleep`。
 - 波 C：json、json_lines、rubydebug、multiline codec。状态：通过，带下面的限制。`json` 编码是 `Event::to_json`，解码失败把原文放进 `message` 并打 `_jsonparsefailure`。`json_lines` 在 JSON 后加分隔符，默认换行。`rubydebug` 按 amazing_print 的形状输出，键用引号，字符串值用引号，末尾有换行。`stdout` 不写 codec 时用 `rubydebug`。`multiline` 3.1.2：`pattern`、`what`（previous/next）、`negate`、`max_lines`（默认 500）、`max_bytes`（默认 10 MiB）、`multiline_tag`。模式名走 legacy 模式库，和 `Patterns::Core.path` 不带参数一致。`file` 输入结束时 flush，和 `exit_flush` 一致；`stdin` 不 flush，最后一段留在缓冲里。`auto_flush_interval` 不是后台计时器。`charset` 只认 `UTF-8`，别的字符集报未实现。`multiline` 不能当输出编码。
-- 波 D：file、tcp、udp、http、beats。状态：file 的 sincedb 通过，其余还没做。sincedb 在插件里，不在 core。一行是 `inode major minor position changed_at path`；只有四列的旧行没有时间和路径。Windows 的 inode 是 `volumeSerial-fileIndexLow-fileIndexHigh`，设备号是 0。`mode => read` 从开头读，已有检查点就从检查点接着读，读完默认删文件（`file_completed_action => delete`）。`tail` 第一次见到文件时 `start_position => end` 停在文件末尾。这一趟读完就返回，不会一直 tail。`tcp`、`udp`、`http`、`beats` 还没做。
+- 波 D：file、tcp、udp、http、beats。状态：通过，带下面的限制。sincedb 在插件里，不在 core。一行是 `inode major minor position changed_at path`；只有四列的旧行没有时间和路径。Windows 的 inode 是 `volumeSerial-fileIndexLow-fileIndexHigh`，设备号是 0。`mode => read` 从开头读，已有检查点就从检查点接着读，读完默认删文件（`file_completed_action => delete`）。`tail` 第一次见到文件时 `start_position => end` 停在文件末尾。这一趟读完就返回，不会一直 tail。`tcp` 输入默认 server，`port` 必填，默认 codec 是 `line`，ECS 关闭时写 `host`、`port` 和 `[@metadata][ip_address]`。`tcp` 输出默认 client，默认 codec 是 `json`。`udp` 输入默认 codec 是 `plain`，ECS 关闭时把来源地址写进 `host`，打开时写 `[host][ip]`。`udp` 输出的 `port` 先做 sprintf。`http` 输入默认 8080，`application/json` 按 json codec 解 body，`user` 设置时要 Basic 认证，应答默认 200。`http` 输出要 `url` 和 `http_method`。`beats` 收 lumberjack v2 的 `W` 和 `J` 帧，并回 `A` ack。验收 `cargo test --test file_sincedb --test netio`。
 - 波 E：持久队列页格式和 `pqcheck`/`pqrepair`，然后死信队列。已有 `path.data/queue` 的用户要能接着读，格式以 9.5.2 落盘字节为准。
 - 波 F：elasticsearch、kafka、jdbc 的协议行为。
 - 波 G：监控 API（先确认 JVM 段）、热加载、`pipeline` 输入输出。
@@ -115,9 +116,9 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## 插件清单
 
-已对齐：`generator`、`stdout`（codec 可以是 `plain`、`line`、`json`、`json_lines`、`dots`、`rubydebug`；缺省是 `rubydebug`）、`plain`、`line`、`drop`、`mutate` 3.6.0、`stdin`、`dots`、`sink`、`uuid`、`json` 过滤器和 codec、`json_lines`、`multiline`（见波 C）、`kv`、`dissect`、`csv`、`date`、`clone`、`split`、`prune`、`fingerprint`（SHA1/SHA256/UUID/PUNCTUATION）、`urldecode`、`truncate`、`syslog_pri`、`de_dot`、`anonymize`、`sleep`、`heartbeat`（`count` 必须是非负整数；`-1` 会一直跑，这里直接报错）、`exec`（要 `interval`，命令跑一次就结束；`schedule` 报未实现）、`file` 输入（官方 sincedb 文本；`mode => read` 或 tail 的一次读取；codec 可以是 `multiline`）和 `file` 输出（追加写）。`null` 与 `sink` 一样不写 stdout。`grok` 展开 patterns-core 4.3.4 的全部模式。
+已对齐：`generator`、`stdout`（codec 可以是 `plain`、`line`、`json`、`json_lines`、`dots`、`rubydebug`；缺省是 `rubydebug`）、`plain`、`line`、`drop`、`mutate` 3.6.0、`stdin`、`dots`、`sink`、`uuid`、`json` 过滤器和 codec、`json_lines`、`multiline`（见波 C）、`kv`、`dissect`、`csv`、`date`、`clone`、`split`、`prune`、`fingerprint`（SHA1/SHA256/UUID/PUNCTUATION）、`urldecode`、`truncate`、`syslog_pri`、`de_dot`、`anonymize`、`sleep`、`heartbeat`（`count` 必须是非负整数；`-1` 会一直跑，这里直接报错）、`exec`（要 `interval`，命令跑一次就结束；`schedule` 报未实现）、`file` 输入（官方 sincedb 文本；`mode => read` 或 tail 的一次读取；codec 可以是 `multiline`）和 `file` 输出（追加写）、`tcp` 输入输出、`udp` 输入输出、`http` 输入输出、`beats` 输入（见波 D）。`null` 与 `sink` 一样不写 stdout。`grok` 展开 patterns-core 4.3.4 的全部模式。
 
-未实现（出现在配置里必须报错并退出非 0）：上面没有点名的 Gemfile 插件，包括 `tcp`、`udp`、`http`、`beats`、持久队列、死信队列、`elasticsearch`、`kafka`、`jdbc`、监控 API、热加载、`pipeline` 输入输出、plugin 子命令、keystore、x-pack。`exec` 的 cron、`heartbeat` 的无限循环、file 的持续 tail，也还没有。input 段里的 `if` 报未实现，不猜。
+未实现（出现在配置里必须报错并退出非 0）：上面没有点名的 Gemfile 插件，包括持久队列、死信队列、`elasticsearch`、`kafka`、`jdbc`、监控 API、热加载、`pipeline` 输入输出、plugin 子命令、keystore、x-pack。`exec` 的 cron、`heartbeat` 的无限循环、file 的持续 tail、这些网络插件的 TLS，也还没有。input 段里的 `if` 报未实现，不猜。
 
 ## 不做
 
@@ -131,4 +132,4 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## Git
 
-远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `dabaac5`。这次提交把 file 的 sincedb 改成 4.4.7 的文本格式。tcp、udp、http、beats 还没做。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
+远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `d9d68ba`。这次提交加上 tcp、udp、http、beats 的明文收发。持久队列还没做。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。

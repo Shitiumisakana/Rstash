@@ -271,6 +271,23 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
         }
+        (Kind::Output, "tcp") => {
+            let encoded = encode_event(plugin, &event, "json")?;
+            crate::netio::tcp_send(plugin, &encoded)?;
+            shared.events.lock().expect("events").push(event);
+            Ok(Vec::new())
+        }
+        (Kind::Output, "udp") => {
+            let encoded = encode_event(plugin, &event, "json")?;
+            crate::netio::udp_send(plugin, &event, &encoded)?;
+            shared.events.lock().expect("events").push(event);
+            Ok(Vec::new())
+        }
+        (Kind::Output, "http") => {
+            crate::netio::http_send(plugin, &event)?;
+            shared.events.lock().expect("events").push(event);
+            Ok(Vec::new())
+        }
         (kind, name) => Err(fail(unimplemented(kind, name))),
     }
 }
@@ -337,7 +354,7 @@ fn check_statement(statement: &Statement) -> Result<(), RunError> {
                 return Err(fail(unimplemented(plugin.kind, &plugin.name)));
             }
             if plugin.kind == Kind::Output
-                && matches!(plugin.name.as_str(), "stdout" | "file")
+                && matches!(plugin.name.as_str(), "stdout" | "file" | "tcp" | "udp")
                 && let Some(name) = codec_name(plugin)
                 && !codec_known(name)
             {
@@ -551,7 +568,15 @@ fn codec_known(name: &str) -> bool {
 }
 
 fn encode_stdout(plugin: &Plugin, event: &Event) -> Result<String, RunError> {
-    let codec = codec_of(plugin, "rubydebug")?;
+    encode_event(plugin, event, "rubydebug")
+}
+
+pub(crate) fn encode_event(
+    plugin: &Plugin,
+    event: &Event,
+    default_codec: &str,
+) -> Result<String, RunError> {
+    let codec = codec_of(plugin, default_codec)?;
     let body = if let Some(format) = &codec.format {
         event.sprintf(format).map_err(event_fail)?
     } else {

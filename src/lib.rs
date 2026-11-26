@@ -14,6 +14,7 @@ mod filewatch;
 mod grok;
 mod lscl;
 mod mutate;
+mod netio;
 mod pattern_files;
 mod plugins;
 mod run;

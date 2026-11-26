@@ -23,31 +23,34 @@ use crate::value::{Map, Value};
 pub(crate) fn known(kind: Kind, name: &str) -> bool {
     matches!(
         (kind, name),
-        (Kind::Input, "stdin" | "heartbeat" | "exec" | "file")
-            | (
-                Kind::Filter,
-                "uuid"
-                    | "json"
-                    | "clone"
-                    | "split"
-                    | "prune"
-                    | "urldecode"
-                    | "truncate"
-                    | "syslog_pri"
-                    | "de_dot"
-                    | "anonymize"
-                    | "csv"
-                    | "date"
-                    | "dissect"
-                    | "kv"
-                    | "fingerprint"
-                    | "sleep"
-            )
-            | (Kind::Output, "null" | "sink" | "file")
-            | (
-                Kind::Codec,
-                "dots" | "json" | "json_lines" | "rubydebug" | "multiline"
-            )
+        (
+            Kind::Input,
+            "stdin" | "heartbeat" | "exec" | "file" | "tcp" | "udp" | "http" | "beats"
+        ) | (
+            Kind::Filter,
+            "uuid"
+                | "json"
+                | "clone"
+                | "split"
+                | "prune"
+                | "urldecode"
+                | "truncate"
+                | "syslog_pri"
+                | "de_dot"
+                | "anonymize"
+                | "csv"
+                | "date"
+                | "dissect"
+                | "kv"
+                | "fingerprint"
+                | "sleep"
+        ) | (
+            Kind::Output,
+            "null" | "sink" | "file" | "tcp" | "udp" | "http"
+        ) | (
+            Kind::Codec,
+            "dots" | "json" | "json_lines" | "rubydebug" | "multiline"
+        )
     )
 }
 
@@ -57,6 +60,10 @@ pub(crate) fn produce(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>
         "heartbeat" => heartbeat_input(plugin, settings),
         "exec" => exec_input(plugin, settings),
         "file" => file_input(plugin, settings),
+        "tcp" => crate::netio::tcp_input(plugin, settings),
+        "udp" => crate::netio::udp_input(plugin, settings),
+        "http" => crate::netio::http_input(plugin, settings),
+        "beats" => crate::netio::beats_input(plugin, settings),
         other => Err(fail(format!("plugin input {other} is not implemented"))),
     }
 }
