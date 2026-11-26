@@ -15,6 +15,14 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
     let mut batch_size = None;
     let mut index = 0;
     let mut test_and_exit = false;
+    if args.first().map(String::as_str) == Some("pqcheck") {
+        let path = args
+            .get(1)
+            .ok_or_else(|| "pqcheck needs a queue directory".to_string())?;
+        crate::queue::check_directory(Path::new(path)).map_err(show)?;
+        let _ = writeln!(stdout, "OK");
+        return Ok(0);
+    }
     while index < args.len() {
         let arg = args[index].as_str();
         let next = || {

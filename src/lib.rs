@@ -17,6 +17,7 @@ mod mutate;
 mod netio;
 mod pattern_files;
 mod plugins;
+mod queue;
 mod run;
 mod timefmt;
 mod value;
@@ -35,6 +36,9 @@ pub use field::{
     parse_field_escaped, same_interned_field,
 };
 pub use mutate::parse_signed_hex_str;
+pub use queue::{
+    Checkpoint, check_directory, read_checkpoint, read_page, write_checkpoint, write_page,
+};
 pub use run::{
     Ecs, PipelineConfig, RunError, RunResult, Settings, apply_filter, apply_logstash_yml,
     load_pipelines_yml, run, run_many,
