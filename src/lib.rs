@@ -8,6 +8,7 @@ pub mod cli;
 mod codec;
 mod digest;
 mod dlq;
+mod elastic;
 mod error;
 mod event;
 mod field;

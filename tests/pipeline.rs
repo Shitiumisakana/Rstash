@@ -111,12 +111,12 @@ fn drop_mutate_and_line_codec() {
     let missing = run(
         r#"
             input { generator { count => 1 } }
-            output { elasticsearch { } }
+            output { s3 { } }
         "#,
         &settings(),
     );
-    let error = missing.expect_err("elasticsearch");
-    assert!(error.to_string().contains("output elasticsearch"));
+    let error = missing.expect_err("s3");
+    assert!(error.to_string().contains("output s3"));
 }
 
 #[test]

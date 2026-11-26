@@ -54,7 +54,7 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                 | "sleep"
         ) | (
             Kind::Output,
-            "null" | "sink" | "file" | "tcp" | "udp" | "http"
+            "null" | "sink" | "file" | "tcp" | "udp" | "http" | "elasticsearch"
         ) | (
             Kind::Codec,
             "dots" | "json" | "json_lines" | "rubydebug" | "multiline"

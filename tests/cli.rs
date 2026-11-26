@@ -40,12 +40,12 @@ fn cli_test_and_exit() {
     let error = execute(
         &[
             "-e".to_string(),
-            "input { generator { count => 1 } } output { elasticsearch { } }".to_string(),
+            "input { generator { count => 1 } } output { s3 { } }".to_string(),
         ],
         &mut missing,
     )
     .expect_err("unimplemented");
-    assert!(error.contains("elasticsearch"));
+    assert!(error.contains("s3"));
 
     let mut ran = Vec::new();
     let code = execute(

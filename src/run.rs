@@ -339,6 +339,11 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
         }
+        (Kind::Output, "elasticsearch") => {
+            crate::elastic::send(plugin, &event, &shared.settings)?;
+            shared.events.lock().expect("events").push(event);
+            Ok(Vec::new())
+        }
         (kind, name) => Err(fail(unimplemented(kind, name))),
     }
 }
