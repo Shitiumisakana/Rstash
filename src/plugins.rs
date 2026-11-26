@@ -36,6 +36,7 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                 | "dead_letter_queue"
                 | "elasticsearch"
                 | "jdbc"
+                | "kafka"
         ) | (
             Kind::Filter,
             "uuid"
@@ -78,6 +79,7 @@ pub(crate) fn produce(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>
         "dead_letter_queue" => dlq_input(plugin, settings),
         "elasticsearch" => crate::elastic_query::read(plugin, settings),
         "jdbc" => crate::jdbc::read(plugin, settings),
+        "kafka" => crate::kafka::poll(plugin, settings),
         other => Err(fail(format!("plugin input {other} is not implemented"))),
     }
 }

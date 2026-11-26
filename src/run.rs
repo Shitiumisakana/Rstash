@@ -414,12 +414,11 @@ fn check_statement(statement: &Statement) -> Result<(), RunError> {
             if !known {
                 return Err(fail(unimplemented(plugin.kind, &plugin.name)));
             }
-            if plugin.kind == Kind::Output
-                && matches!(
-                    plugin.name.as_str(),
-                    "stdout" | "file" | "tcp" | "udp" | "kafka"
-                )
-                && let Some(name) = codec_name(plugin)
+            if matches!(
+                (plugin.kind, plugin.name.as_str()),
+                (Kind::Output, "stdout" | "file" | "tcp" | "udp" | "kafka")
+                    | (Kind::Input, "kafka")
+            ) && let Some(name) = codec_name(plugin)
                 && !codec_known(name)
             {
                 return Err(fail(unimplemented(Kind::Codec, name)));
