@@ -11,6 +11,94 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+pub fn sha1_hex(text: &str) -> String {
+    sha1(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn hmac_sha1_hex(key: &str, data: &str) -> String {
+    hmac(sha1, 64, key.as_bytes(), data.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn hmac_sha256_hex(key: &str, data: &str) -> String {
+    hmac(sha256, 64, key.as_bytes(), data.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hmac(hash: fn(&[u8]) -> Vec<u8>, block: usize, key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut key_block = if key.len() > block {
+        hash(key)
+    } else {
+        key.to_vec()
+    };
+    key_block.resize(block, 0);
+    let mut inner = key_block.iter().map(|byte| byte ^ 0x36).collect::<Vec<_>>();
+    inner.extend_from_slice(data);
+    let mut outer = key_block.iter().map(|byte| byte ^ 0x5c).collect::<Vec<_>>();
+    outer.extend(hash(&inner));
+    hash(&outer)
+}
+
+fn sha1(message: &[u8]) -> Vec<u8> {
+    let mut hash: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let bit_len = (message.len() as u64).wrapping_mul(8);
+    let mut data = message.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in data.chunks(64) {
+        let mut words = [0u32; 80];
+        for index in 0..16 {
+            words[index] = u32::from_be_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap());
+        }
+        for index in 16..80 {
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (hash[0], hash[1], hash[2], hash[3], hash[4]);
+        #[allow(clippy::needless_range_loop)]
+        for index in 0..80 {
+            let (f, k) = match index {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(words[index]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        hash[0] = hash[0].wrapping_add(a);
+        hash[1] = hash[1].wrapping_add(b);
+        hash[2] = hash[2].wrapping_add(c);
+        hash[3] = hash[3].wrapping_add(d);
+        hash[4] = hash[4].wrapping_add(e);
+    }
+    let mut out = Vec::with_capacity(20);
+    for word in hash {
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
 pub fn sha256_hex(text: &str) -> String {
     sha256(text.as_bytes())
         .iter()
@@ -18,7 +106,7 @@ pub fn sha256_hex(text: &str) -> String {
         .collect()
 }
 
-fn sha256(message: &[u8]) -> [u8; 32] {
+fn sha256(message: &[u8]) -> Vec<u8> {
     let mut hash: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -77,16 +165,16 @@ fn sha256(message: &[u8]) -> [u8; 32] {
         hash[6] = hash[6].wrapping_add(g);
         hash[7] = hash[7].wrapping_add(h);
     }
-    let mut out = [0u8; 32];
-    for (index, word) in hash.iter().enumerate() {
-        out[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    let mut out = Vec::with_capacity(32);
+    for word in hash {
+        out.extend_from_slice(&word.to_be_bytes());
     }
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sha256_hex;
+    use super::{sha1_hex, sha256_hex};
 
     #[test]
     fn known_vectors() {
@@ -98,5 +186,6 @@ mod tests {
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        assert_eq!(sha1_hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     }
 }

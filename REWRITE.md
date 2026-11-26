@@ -2,7 +2,7 @@
 
 - 形态：兼容重实现。交付物是纯 Rust 源码和一个 Rust 二进制。进程里没有 JVM、没有 JRuby、没有 Ruby 解释器，也不去调用 `java`。
 - 主案例：Rspack。
-- 当前切片：第 5 到第 8 片已通过，并且第 5 到第 8 片用到的官方测例已经逐条转写。下一位从波 A 开始（stdin、dots、sink、uuid）。不要重写事件模型、LSCL 编译器，也不要重写已经能跑的内存管道。
+- 当前切片：第 5 到第 8 片已通过。波 A，以及波 B、波 C 里不靠外部服务的过滤器和 codec，已经接上。下一位继续波 B 的完整 grok、波 C 的 multiline，然后波 D（tcp、udp、http、beats）。不要重写事件模型、LSCL 编译器，也不要重写已经能跑的内存管道。
 - 上一片：第 2 到第 4 片一起验收。命令 `cargo test` 覆盖 event_fields、parse_sections、conditions、compile_graph。日期 2026-11-25。后又加了 `cargo test --test official`。
 - 官方测试：发行包里没有 JUnit / RSpec。源在 `elastic/logstash` tag `v9.5.2`，本机副本在 `target/upstream/logstash`（已 gitignore）。这些测试构造的是 `org.logstash.Event` 和 JRuby，不能直接对 `rstash` 执行。对照方式是把同一批配置和断言喂给 Rust，编译期望值由 9.5.2 的 `compile_imperative` 打到 `tests/fixtures/oracle/official_compiler.txt`。
 - `compiler_spec.rb` 和 `config_ast_spec.rb` 里能落到 LSCL 的配置共 83 条，期望值是 9.5.2 `compile_imperative` 的图文本。另外按原断言核对了语句上的 source 协议、id、行号、列号和插件原文，`config.support_escapes` 打开时参数值是处理后的字符串。`010` 按 Ruby `Integer()` 是八进制 8。
@@ -101,9 +101,9 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 第 5 片通过之后才进入插件波次。每一波仍是一片一片做，每片用旧 `bin/logstash` 的 stdout 或退出码验收。
 
-- 波 A：stdin、dots、sink、uuid。
-- 波 B：date、json、kv、dissect、csv、grok、clone、fingerprint、prune。
-- 波 C：json、json_lines、rubydebug、multiline codec。
+- 波 A：stdin、dots、sink、uuid。状态：通过。验收 `cargo test --test waves`。`stdin` 默认按行读，`Settings.stdin` 有值时用那一段文本，否则读到 EOF。`dots` 每个事件编码成一个 `.`，不能解码。`sink` 丢掉输出字节，事件仍记在运行结果里。`uuid` 要 `target`；`overwrite` 默认 false，写出的是版本 4 的十六进制字符串。
+- 波 B：date、json、kv、dissect、csv、grok、clone、fingerprint、prune。状态：部分通过。`date` 认 `UNIX`、`UNIX_MS`、`ISO8601` 和一段 Joda 字母（`y M d H m s S`）。`json` 解析失败打 `_jsonparsefailure`。`kv` 用字面量 `field_split` / `value_split`。`dissect` 认普通字段、`?` 跳过、`+` 拼接、`&` 间接字段。`csv` 认 `columns`、`separator`、`convert` 的 integer/float/boolean。`clone` 在 ECS 关闭时写 `type`，打开时加 tag，原事件保留。`fingerprint` 的 `SHA1`、`SHA256`、`UUID`、`PUNCTUATION` 可用，其它方法报未实现。`prune` 只处理顶层字段名。`grok` 仍然只认 `%{WORD:名字}` 和 `(?:字面量)`，完整模式库还没做。同一批还接上了 `split`、`urldecode`、`truncate`、`syslog_pri`、`de_dot`、`anonymize`（HMAC-SHA1 / HMAC-SHA256）、`sleep`。
+- 波 C：json、json_lines、rubydebug、multiline codec。状态：部分通过。`json` 编码是 `Event::to_json`，解码失败把原文放进 `message` 并打 `_jsonparsefailure`。`json_lines` 在 JSON 后加分隔符，默认换行。`rubydebug` 按 amazing_print 的形状输出，键用引号，字符串值用引号，末尾有换行。`stdout` 不写 codec 时用 `rubydebug`。`multiline` 还没做。
 - 波 D：file、tcp、udp、http、beats。file 的 sincedb 在插件里，不在 core。
 - 波 E：持久队列页格式和 `pqcheck`/`pqrepair`，然后死信队列。已有 `path.data/queue` 的用户要能接着读，格式以 9.5.2 落盘字节为准。
 - 波 F：elasticsearch、kafka、jdbc 的协议行为。
@@ -112,9 +112,9 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## 插件清单
 
-已对齐：`generator`（有限 count，ECS v8/v1 与 disabled，`message => "stdin"` 读一行）、`stdout`（codec 只能是 `plain` 或 `line`）、`plain`、`line`、`drop`、`mutate` 3.6.0（coerce、rename、update、replace、convert、gsub、大小写、strip、split、join、merge、copy、add/remove field 和 tag）。`grok` 只实现了 mutate 官方测例用到的 `%{WORD:名字}` 和 `(?:字面量)`。
+已对齐：`generator`、`stdout`（codec 可以是 `plain`、`line`、`json`、`json_lines`、`dots`、`rubydebug`；缺省是 `rubydebug`）、`plain`、`line`、`drop`、`mutate` 3.6.0、`stdin`、`dots`、`sink`、`uuid`、`json` 过滤器和 codec、`json_lines`、`kv`、`dissect`、`csv`、`date`、`clone`、`split`、`prune`、`fingerprint`（SHA1/SHA256/UUID/PUNCTUATION）、`urldecode`、`truncate`、`syslog_pri`、`de_dot`、`anonymize`、`sleep`、`heartbeat`（`count` 必须是非负整数；`-1` 会一直跑，这里直接报错）、`exec`（要 `interval`，命令跑一次就结束；`schedule` 报未实现）、`file` 输入（`mode => read` 或 `start_position => beginning` 读完当前内容；`sincedb_path` 记下字节偏移）和 `file` 输出（追加写）。`null` 与 `sink` 一样不写 stdout。`grok` 只认 `%{WORD:名字}` 和 `(?:字面量)`。
 
-未实现（出现在配置里必须报错并退出非 0）：发行包 Gemfile 中的其余插件，以及核心自带的 stdin、uuid、sink、dots、pipeline、rubydebug。上面两种之外的 grok 模式、input 段里的 `if` 也报未实现，不猜。
+未实现（出现在配置里必须报错并退出非 0）：上面没有点名的 Gemfile 插件，包括 `multiline`、`tcp`、`udp`、`http`、`beats`、持久队列、死信队列、`elasticsearch`、`kafka`、`jdbc`、监控 API、热加载、`pipeline` 输入输出、plugin 子命令、keystore、x-pack。完整 grok、`exec` 的 cron、`heartbeat` 的无限循环、file 的持续 tail，也还没有。input 段里的 `if` 报未实现，不猜。
 
 ## 不做
 
@@ -128,4 +128,4 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## Git
 
-远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `f8c9eb7`。这次提交把 mutate 3.6.0 官方测例补全。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
+远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `04de38c`。这次提交接上波 A，以及波 B、波 C 里不靠外部服务的过滤器和 codec。波 D 及以后还没做。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。

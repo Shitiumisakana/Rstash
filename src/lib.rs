@@ -13,6 +13,7 @@ mod field;
 mod grok;
 mod lscl;
 mod mutate;
+mod plugins;
 mod run;
 mod timefmt;
 mod value;

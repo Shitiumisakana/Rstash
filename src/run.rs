@@ -131,7 +131,7 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
         producers.push(thread::spawn(move || {
             let produced = match plugin.name.as_str() {
                 "generator" => generator(&plugin, &shared.settings),
-                other => Err(fail(unimplemented(Kind::Input, other))),
+                _ => crate::plugins::produce(&plugin, &shared.settings),
             };
             match produced {
                 Ok(events) => {
@@ -183,15 +183,15 @@ fn worker(shared: &Shared) {
         .queue
         .read_batch(batch_size, shared.settings.batch_delay)
     {
-        for mut event in batch {
-            match apply(&shared.filter, &mut event, shared) {
-                Ok(true) => match apply(&shared.output, &mut event, shared) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        *shared.error.lock().expect("error") = Some(error.message);
+        for event in batch {
+            match apply(&shared.filter, event, shared) {
+                Ok(events) => {
+                    for event in events {
+                        if let Err(error) = apply(&shared.output, event, shared) {
+                            *shared.error.lock().expect("error") = Some(error.message);
+                        }
                     }
-                },
-                Ok(false) => {}
+                }
                 Err(error) => {
                     *shared.error.lock().expect("error") = Some(error.message);
                 }
@@ -200,20 +200,23 @@ fn worker(shared: &Shared) {
     }
 }
 
-/// Returns false when a filter cancelled the event.
-fn apply(statement: &Statement, event: &mut Event, shared: &Shared) -> Result<bool, RunError> {
+/// Events that continue. An empty list means the event was cancelled.
+fn apply(statement: &Statement, event: Event, shared: &Shared) -> Result<Vec<Event>, RunError> {
     if event.is_cancelled() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     match statement {
-        Statement::Noop => Ok(true),
+        Statement::Noop => Ok(vec![event]),
         Statement::Sequence(children) | Statement::Parallel(children) => {
+            let mut batch = vec![event];
             for child in children {
-                if !apply(child, event, shared)? {
-                    return Ok(false);
+                let mut next = Vec::new();
+                for item in batch {
+                    next.extend(apply(child, item, shared)?);
                 }
+                batch = next;
             }
-            Ok(true)
+            Ok(batch)
         }
         Statement::If {
             condition,
@@ -221,7 +224,7 @@ fn apply(statement: &Statement, event: &mut Event, shared: &Shared) -> Result<bo
             when_false,
             ..
         } => {
-            if eval(condition, event)? {
+            if eval(condition, &event)? {
                 apply(when_true, event, shared)
             } else {
                 apply(when_false, event, shared)
@@ -231,28 +234,39 @@ fn apply(statement: &Statement, event: &mut Event, shared: &Shared) -> Result<bo
     }
 }
 
-fn dispatch(plugin: &Plugin, event: &mut Event, shared: &Shared) -> Result<bool, RunError> {
+fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Event>, RunError> {
     match (plugin.kind, plugin.name.as_str()) {
         (Kind::Filter, "drop") => {
             if drop_event(plugin) {
                 event.cancel();
-                return Ok(false);
+                return Ok(Vec::new());
             }
-            Ok(true)
+            Ok(vec![event])
         }
         (Kind::Filter, "mutate") => {
-            crate::mutate::apply(plugin, event)?;
-            Ok(true)
+            crate::mutate::apply(plugin, &mut event)?;
+            Ok(vec![event])
         }
         (Kind::Filter, "grok") => {
-            crate::grok::apply(plugin, event)?;
-            Ok(true)
+            crate::grok::apply(plugin, &mut event)?;
+            Ok(vec![event])
         }
+        (Kind::Filter, _) => crate::plugins::filter(plugin, event, &shared.settings),
         (Kind::Output, "stdout") => {
-            let encoded = encode_stdout(plugin, event)?;
+            let encoded = encode_stdout(plugin, &event)?;
             shared.stdout.lock().expect("stdout").push_str(&encoded);
             shared.events.lock().expect("events").push(event.clone());
-            Ok(true)
+            Ok(vec![event])
+        }
+        (Kind::Output, "null" | "sink") => {
+            shared.events.lock().expect("events").push(event);
+            Ok(Vec::new())
+        }
+        (Kind::Output, "file") => {
+            let encoded = encode_stdout(plugin, &event)?;
+            crate::plugins::write_file(plugin, &encoded)?;
+            shared.events.lock().expect("events").push(event);
+            Ok(Vec::new())
         }
         (kind, name) => Err(fail(unimplemented(kind, name))),
     }
@@ -315,15 +329,16 @@ fn check_statement(statement: &Statement) -> Result<(), RunError> {
                     | (Kind::Filter, "drop" | "mutate" | "grok")
                     | (Kind::Output, "stdout")
                     | (Kind::Codec, "plain" | "line")
-            );
+            ) || crate::plugins::known(plugin.kind, &plugin.name);
             if !known {
                 return Err(fail(unimplemented(plugin.kind, &plugin.name)));
             }
-            if plugin.kind == Kind::Output && plugin.name == "stdout" {
-                match codec_name(plugin) {
-                    Some("plain" | "line") => {}
-                    _ => return Err(fail("plugin codec rubydebug is not implemented")),
-                }
+            if plugin.kind == Kind::Output
+                && matches!(plugin.name.as_str(), "stdout" | "file")
+                && let Some(name) = codec_name(plugin)
+                && !codec_known(name)
+            {
+                return Err(fail(unimplemented(Kind::Codec, name)));
             }
             for (_, value) in &plugin.args {
                 check_arg(value)?;
@@ -336,10 +351,10 @@ fn check_statement(statement: &Statement) -> Result<(), RunError> {
 fn check_arg(arg: &Arg) -> Result<(), RunError> {
     match arg {
         Arg::Plugin(plugin) => {
-            if !matches!(
-                (plugin.kind, plugin.name.as_str()),
-                (Kind::Codec, "plain" | "line")
-            ) {
+            if plugin.kind == Kind::Codec && !codec_known(&plugin.name) {
+                return Err(fail(unimplemented(plugin.kind, &plugin.name)));
+            }
+            if plugin.kind != Kind::Codec {
                 return Err(fail(unimplemented(plugin.kind, &plugin.name)));
             }
             Ok(())
@@ -528,6 +543,10 @@ fn decorate(plugin: &Plugin, event: &mut Event) -> Result<(), RunError> {
     Ok(())
 }
 
+fn codec_known(name: &str) -> bool {
+    matches!(name, "plain" | "line") || crate::plugins::known(Kind::Codec, name)
+}
+
 fn encode_stdout(plugin: &Plugin, event: &Event) -> Result<String, RunError> {
     let codec = codec_of(plugin, "rubydebug")?;
     let body = if let Some(format) = &codec.format {
@@ -535,11 +554,15 @@ fn encode_stdout(plugin: &Plugin, event: &Event) -> Result<String, RunError> {
     } else {
         match codec.name.as_str() {
             "plain" | "line" => event.plain_string(),
-            other => return Err(fail(format!("plugin codec {other} is not implemented"))),
+            name => crate::plugins::encode(name, &codec.delimiter, codec.metadata, event)?,
         }
     };
-    Ok(if codec.name == "line" {
-        body + &codec.delimiter
+    Ok(if codec.name == "line" || codec.name == "json_lines" {
+        if codec.name == "json_lines" {
+            body
+        } else {
+            body + &codec.delimiter
+        }
     } else {
         body
     })
@@ -549,6 +572,7 @@ struct CodecSpec {
     name: String,
     delimiter: String,
     format: Option<String>,
+    metadata: bool,
 }
 
 fn codec_name(plugin: &Plugin) -> Option<&str> {
@@ -561,25 +585,23 @@ fn codec_name(plugin: &Plugin) -> Option<&str> {
 
 fn codec_of(plugin: &Plugin, default_name: &str) -> Result<CodecSpec, RunError> {
     match arg(plugin, "codec") {
-        None => {
-            if default_name == "rubydebug" {
-                return Err(fail("plugin codec rubydebug is not implemented"));
-            }
-            Ok(CodecSpec {
-                name: default_name.to_string(),
-                delimiter: "\n".to_string(),
-                format: None,
-            })
-        }
+        None => Ok(CodecSpec {
+            name: default_name.to_string(),
+            delimiter: "\n".to_string(),
+            format: None,
+            metadata: false,
+        }),
         Some(Arg::String(name)) => Ok(CodecSpec {
             name: name.clone(),
             delimiter: "\n".to_string(),
             format: None,
+            metadata: false,
         }),
         Some(Arg::Plugin(codec)) => Ok(CodecSpec {
             name: codec.name.clone(),
             delimiter: arg_string(codec, "delimiter").unwrap_or_else(|| "\n".to_string()),
             format: arg_string(codec, "format"),
+            metadata: arg_string(codec, "metadata").as_deref() == Some("true"),
         }),
         Some(_) => Err(fail("codec must be a name or a codec block")),
     }
@@ -818,7 +840,7 @@ fn key_text(key: &Key) -> String {
     }
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "localhost".to_string())
@@ -988,7 +1010,13 @@ pub fn apply_filter(config: &str, event: &mut Event) -> Result<(), RunError> {
         events: Mutex::new(Vec::new()),
         error: Mutex::new(None),
     };
-    apply(&pipeline.filter, event, &shared)?;
+    let owned = std::mem::take(event);
+    let mut produced = apply(&pipeline.filter, owned, &shared)?;
+    if produced.is_empty() {
+        event.cancel();
+    } else {
+        *event = produced.remove(0);
+    }
     if let Some(message) = shared.error.lock().expect("error").clone() {
         return Err(fail(message));
     }
@@ -1144,6 +1172,7 @@ mod tests {
             name: "line".to_string(),
             delimiter: "\n".to_string(),
             format: None,
+            metadata: false,
         };
         let mut pending = String::new();
         let lines = codec_decode(&codec, &mut pending, "one\ntwo").expect("decode");
