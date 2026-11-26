@@ -69,6 +69,7 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
     }
     if let Some(workers) = workers {
         settings.workers = workers;
+        settings.workers_set = true;
     }
     if let Some(batch_size) = batch_size {
         settings.batch_size = batch_size;
@@ -96,9 +97,10 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
                 .map_err(|error| format!("cannot read {}: {error}", yml.display()))?;
             load_pipelines_yml(&text).map_err(show)?
         } else {
-            return Err(
-                "no configuration. Use -e, -f, or --path.settings with pipelines.yml".to_string(),
-            );
+            return Err(format!(
+                "Failed to read pipelines yaml file. Location: {}",
+                yml.display()
+            ));
         }
     } else {
         return Err(

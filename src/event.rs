@@ -297,8 +297,14 @@ impl Event {
         }
     }
 
+    /// Java `Event#includes`: the key is present, including when its value is null.
     pub fn includes(&self, reference: &str) -> Result<bool, EventError> {
-        Ok(self.get_field(reference)?.is_some())
+        let field = field::parse_field(reference)?;
+        Ok(match field.target {
+            Target::Data => contains_path(&self.data, &field.path, &field.key),
+            Target::Metadata => contains_path(&self.metadata, &field.path, &field.key),
+            Target::MetadataRoot => true,
+        })
     }
 
     fn timestamp(&self) -> Option<DateTime<Utc>> {
@@ -320,6 +326,38 @@ impl Event {
 impl Default for Event {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn contains_path(map: &Map, path: &[String], key: &str) -> bool {
+    if path.is_empty() {
+        return map.get(key).is_some();
+    }
+    match map.get(&path[0]) {
+        Some(value) => contains_value(value, &path[1..], key),
+        None => false,
+    }
+}
+
+fn contains_value(value: &Value, path: &[String], key: &str) -> bool {
+    if path.is_empty() {
+        return match value {
+            Value::Map(map) => map.get(key).is_some(),
+            Value::Array(items) => list_index(key, items.len()).is_some(),
+            _ => false,
+        };
+    }
+    match value {
+        Value::Map(map) => contains_path(map, path, key),
+        Value::Array(items) => {
+            let Some(index) = list_index(&path[0], items.len()) else {
+                return false;
+            };
+            items
+                .get(index)
+                .is_some_and(|child| contains_value(child, &path[1..], key))
+        }
+        _ => false,
     }
 }
 

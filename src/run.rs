@@ -5,7 +5,7 @@
 //! batch, runs the filter tree, then the output tree. A plugin that is not in
 //! this slice returns an error instead of being skipped.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,6 +31,11 @@ pub struct Settings {
     pub batch_delay: Duration,
     pub ecs: Ecs,
     pub test_and_exit: bool,
+    /// `generator` `message => "stdin"` reads this instead of the process stdin.
+    /// `None` reads one line from stdin, the way `IO#readline` does.
+    pub stdin: Option<String>,
+    /// True when `-w` or `pipeline.workers` in a settings file set the value.
+    pub workers_set: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +48,8 @@ impl Default for Settings {
             batch_delay: Duration::from_millis(50),
             ecs: Ecs::V8,
             test_and_exit: false,
+            stdin: None,
+            workers_set: false,
         }
     }
 }
@@ -67,7 +74,7 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-fn fail(message: impl Into<String>) -> RunError {
+pub(crate) fn fail(message: impl Into<String>) -> RunError {
     RunError {
         message: message.into(),
     }
@@ -234,7 +241,11 @@ fn dispatch(plugin: &Plugin, event: &mut Event, shared: &Shared) -> Result<bool,
             Ok(true)
         }
         (Kind::Filter, "mutate") => {
-            mutate(plugin, event)?;
+            crate::mutate::apply(plugin, event)?;
+            Ok(true)
+        }
+        (Kind::Filter, "grok") => {
+            crate::grok::apply(plugin, event)?;
             Ok(true)
         }
         (Kind::Output, "stdout") => {
@@ -301,7 +312,7 @@ fn check_statement(statement: &Statement) -> Result<(), RunError> {
             let known = matches!(
                 (plugin.kind, plugin.name.as_str()),
                 (Kind::Input, "generator")
-                    | (Kind::Filter, "drop" | "mutate")
+                    | (Kind::Filter, "drop" | "mutate" | "grok")
                     | (Kind::Output, "stdout")
                     | (Kind::Codec, "plain" | "line")
             );
@@ -377,9 +388,6 @@ fn collect_inputs<'a>(statement: &'a Statement, found: &mut Vec<&'a Plugin>) {
 
 fn generator(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunError> {
     let count = arg_i64(plugin, "count").unwrap_or(0);
-    if arg(plugin, "lines").is_none() && arg_string(plugin, "message").as_deref() == Some("stdin") {
-        return Err(fail("generator message => \"stdin\" is not implemented"));
-    }
     if count <= 0 {
         return Err(fail(
             "generator count must be greater than 0; 0 means unlimited and this pipeline does not run forever",
@@ -395,7 +403,20 @@ fn generator(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunErro
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err(fail("generator lines must be an array")),
         None => {
-            vec![arg_string(plugin, "message").unwrap_or_else(|| "Hello world!".to_string())]
+            let message = if arg_string(plugin, "message").as_deref() == Some("stdin") {
+                if let Some(text) = &settings.stdin {
+                    text.clone()
+                } else {
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_line(&mut buf)
+                        .map_err(|error| fail(error.to_string()))?;
+                    buf
+                }
+            } else {
+                arg_string(plugin, "message").unwrap_or_else(|| "Hello world!".to_string())
+            };
+            vec![message]
         }
     };
     let host = hostname();
@@ -496,7 +517,7 @@ fn decorate(plugin: &Plugin, event: &mut Event) -> Result<(), RunError> {
         for (key, value) in entries {
             let field = event.sprintf(&key_text(key)).map_err(event_fail)?;
             let text = event.sprintf(&arg_text(value)?).map_err(event_fail)?;
-            add_field(event, &field, Value::from(text))?;
+            crate::mutate::add_field(event, &field, Value::from(text))?;
         }
     }
     if let Some(Arg::Array(tags)) = arg(plugin, "add_tag").or_else(|| arg(plugin, "tags")) {
@@ -584,177 +605,6 @@ fn unit_random() -> f64 {
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
     f64::from(nanos % 1_000_000) / 1_000_000.0
-}
-
-/// Subset of `logstash-filter-mutate`: rename, convert, then add_field and
-/// remove_field in the order `filter_matched` applies them.
-fn mutate(plugin: &Plugin, event: &mut Event) -> Result<(), RunError> {
-    for (name, _) in &plugin.args {
-        if !matches!(
-            name.as_str(),
-            "rename"
-                | "convert"
-                | "add_field"
-                | "remove_field"
-                | "id"
-                | "enable_metric"
-                | "tag_on_failure"
-        ) {
-            return Err(fail(format!("mutate option {name} is not implemented")));
-        }
-    }
-    if let Some(Arg::Map(entries)) = arg(plugin, "rename") {
-        for (key, value) in entries {
-            let old = event.sprintf(&key_text(key)).map_err(event_fail)?;
-            let new = event.sprintf(&arg_text(value)?).map_err(event_fail)?;
-            if event.includes(&old).map_err(event_fail)?
-                && let Some(removed) = event.remove_field(&old).map_err(event_fail)?
-            {
-                event.set_field(&new, removed).map_err(event_fail)?;
-            }
-        }
-    }
-    if let Some(Arg::Map(entries)) = arg(plugin, "convert") {
-        for (key, value) in entries {
-            let field = event.sprintf(&key_text(key)).map_err(event_fail)?;
-            let kind = arg_text(value)?;
-            convert_field(event, &field, &kind)?;
-        }
-    }
-    if let Some(Arg::Map(entries)) = arg(plugin, "add_field") {
-        for (key, value) in entries {
-            let field = event.sprintf(&key_text(key)).map_err(event_fail)?;
-            let text = event.sprintf(&arg_text(value)?).map_err(event_fail)?;
-            add_field(event, &field, Value::from(text))?;
-        }
-    }
-    if let Some(Arg::Array(fields)) = arg(plugin, "remove_field") {
-        for field in fields {
-            let name = event.sprintf(&arg_text(field)?).map_err(event_fail)?;
-            event.remove_field(&name).map_err(event_fail)?;
-        }
-    } else if let Some(Arg::String(field)) = arg(plugin, "remove_field") {
-        let name = event.sprintf(field).map_err(event_fail)?;
-        event.remove_field(&name).map_err(event_fail)?;
-    }
-    Ok(())
-}
-
-fn add_field(event: &mut Event, field: &str, value: Value) -> Result<(), RunError> {
-    if event.includes(field).map_err(event_fail)? {
-        let mut list = match event.remove_field(field).map_err(event_fail)? {
-            Some(Value::Array(items)) => items,
-            Some(existing) => vec![existing],
-            None => Vec::new(),
-        };
-        list.push(value);
-        event
-            .set_field(field, Value::Array(list))
-            .map_err(event_fail)
-    } else {
-        event.set_field(field, value).map_err(event_fail)
-    }
-}
-
-fn convert_field(event: &mut Event, field: &str, kind: &str) -> Result<(), RunError> {
-    if !event.includes(field).map_err(event_fail)? {
-        return Ok(());
-    }
-    let Some(current) = event.get_field(field).map_err(event_fail)? else {
-        return Ok(());
-    };
-    if matches!(current, Value::Map(_)) {
-        return Ok(());
-    }
-    let converted = match current {
-        Value::Array(items) => {
-            let mut next = Vec::new();
-            for item in items {
-                next.push(convert_value(item, kind));
-            }
-            Value::Array(next)
-        }
-        other => convert_value(other, kind),
-    };
-    event.set_field(field, converted).map_err(event_fail)
-}
-
-fn convert_value(value: Value, kind: &str) -> Value {
-    if matches!(value, Value::Null) {
-        return value;
-    }
-    match kind {
-        "string" => Value::from(value.to_string()),
-        "integer" => convert_integer(value),
-        "float" => convert_float(value),
-        "boolean" => convert_boolean(value),
-        _ => value,
-    }
-}
-
-fn convert_integer(value: Value) -> Value {
-    match value {
-        Value::Integer(number) => Value::Integer(number),
-        Value::Boolean(true) => Value::Integer(1),
-        Value::Boolean(false) => Value::Integer(0),
-        Value::Float(number) => Value::Integer(number as i128),
-        Value::String(text) => parse_integer_text(&text).unwrap_or(Value::String(text)),
-        other => other,
-    }
-}
-
-fn parse_integer_text(text: &str) -> Option<Value> {
-    let cleaned: String = text
-        .chars()
-        .filter(|ch| *ch != ',')
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if let Ok(number) = cleaned.parse::<i128>() {
-        return Some(Value::Integer(number));
-    }
-    let number = cleaned.parse::<f64>().ok()?;
-    Some(Value::Integer(number as i128))
-}
-
-fn convert_float(value: Value) -> Value {
-    match value {
-        Value::Float(number) => Value::Float(number),
-        Value::Integer(number) => Value::Float(number as f64),
-        Value::String(text) => {
-            let cleaned: String = text.chars().filter(|ch| *ch != ',').collect();
-            match cleaned.trim().parse::<f64>() {
-                Ok(number) => Value::Float(number),
-                Err(_) => Value::String(text),
-            }
-        }
-        other => other,
-    }
-}
-
-fn convert_boolean(value: Value) -> Value {
-    let text = value.to_string();
-    if truthy_word(&text) {
-        Value::Boolean(true)
-    } else if text.is_empty() || false_word(&text) {
-        Value::Boolean(false)
-    } else {
-        value
-    }
-}
-
-fn truthy_word(text: &str) -> bool {
-    matches!(
-        text.to_ascii_lowercase().as_str(),
-        "true" | "t" | "yes" | "y" | "1" | "1.0"
-    )
-}
-
-fn false_word(text: &str) -> bool {
-    matches!(
-        text.to_ascii_lowercase().as_str(),
-        "false" | "f" | "no" | "n" | "0" | "0.0"
-    )
 }
 
 fn eval(expr: &Expr, event: &Event) -> Result<bool, RunError> {
@@ -993,6 +843,7 @@ pub fn apply_logstash_yml(settings: &mut Settings, text: &str) -> Result<(), Run
                 settings.workers = value
                     .parse()
                     .map_err(|_| fail(format!("pipeline.workers is not an integer: {value}")))?;
+                settings.workers_set = true;
             }
             "pipeline.batch.size" => {
                 settings.batch_size = value
@@ -1061,16 +912,87 @@ pub fn load_pipelines_yml(text: &str) -> Result<Vec<PipelineConfig>, RunError> {
         pipelines.push(done);
     }
     if pipelines.is_empty() {
-        return Err(fail("pipelines.yml has no pipelines"));
+        return Err(fail("Pipelines YAML file is empty"));
     }
+    let mut seen = HashSet::new();
     for pipeline in &pipelines {
-        if pipeline.id.is_empty() || pipeline.config.is_empty() {
+        if pipeline.id.is_empty() {
             return Err(fail(
                 "each pipelines.yml entry needs pipeline.id and config.string or path.config",
             ));
         }
+        if !seen.insert(pipeline.id.clone()) {
+            return Err(fail(format!(
+                "ConfigurationError: duplicate pipeline ids {}",
+                pipeline.id
+            )));
+        }
     }
     Ok(pipelines)
+}
+
+fn pipeline_setting(key: &str) -> bool {
+    matches!(
+        key,
+        "config.debug"
+            | "config.support_escapes"
+            | "config.string"
+            | "dead_letter_queue.enable"
+            | "dead_letter_queue.flush_interval"
+            | "dead_letter_queue.flush_check_interval"
+            | "dead_letter_queue.max_bytes"
+            | "dead_letter_queue.storage_policy"
+            | "dead_letter_queue.retain.age"
+            | "metric.collect"
+            | "pipeline.plugin_classloaders"
+            | "path.config"
+            | "path.dead_letter_queue"
+            | "path.queue"
+            | "pipeline.batch.delay"
+            | "pipeline.batch.output_chunking.growth_threshold_factor"
+            | "pipeline.batch.metrics.sampling_mode"
+            | "pipeline.batch.size"
+            | "pipeline.id"
+            | "pipeline.reloadable"
+            | "pipeline.recoverable"
+            | "pipeline.system"
+            | "pipeline.workers"
+            | "pipeline.ordered"
+            | "pipeline.ecs_compatibility"
+            | "queue.checkpoint.acks"
+            | "queue.checkpoint.interval"
+            | "queue.checkpoint.writes"
+            | "queue.checkpoint.retry"
+            | "queue.compression"
+            | "queue.drain"
+            | "queue.max_bytes"
+            | "queue.max_events"
+            | "queue.page_capacity"
+            | "queue.type"
+    )
+}
+
+/// Run the filter section of a config against one event.
+/// Configs that are only a `filter` block are wrapped so the existing compiler can read them.
+pub fn apply_filter(config: &str, event: &mut Event) -> Result<(), RunError> {
+    let source = format!(
+        "input {{ generator {{ count => 1 }} }}\n{config}\noutput {{ stdout {{ codec => plain }} }}"
+    );
+    let pipeline = compile_imperative(&source, false).map_err(|error| fail(error.to_string()))?;
+    let shared = Shared {
+        queue: Queue::new(0),
+        filter: pipeline.filter.clone(),
+        output: Statement::Noop,
+        settings: Settings::default(),
+        stdout: Mutex::new(String::new()),
+        events: Mutex::new(Vec::new()),
+        error: Mutex::new(None),
+    };
+    apply(&pipeline.filter, event, &shared)?;
+    if let Some(message) = shared.error.lock().expect("error").clone() {
+        return Err(fail(message));
+    }
+    Ok(())
 }
 
 fn assign_pipeline(pipeline: &mut PipelineConfig, line: &str) -> Result<(), RunError> {
@@ -1087,9 +1009,11 @@ fn assign_pipeline(pipeline: &mut PipelineConfig, line: &str) -> Result<(), RunE
             pipeline.config = std::fs::read_to_string(&value)
                 .map_err(|error| fail(format!("cannot read path.config {value}: {error}")))?;
         }
+        "config.reload.automatic" | "config.reload.interval" => {}
+        other if pipeline_setting(other) => {}
         other => {
             return Err(fail(format!(
-                "pipelines.yml key {other} is not implemented"
+                "Only pipeline related settings are expected. Received \"{other}\"."
             )));
         }
     }

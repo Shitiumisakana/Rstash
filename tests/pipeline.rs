@@ -15,6 +15,8 @@ fn settings() -> Settings {
         batch_delay: Duration::from_millis(50),
         ecs: Ecs::V8,
         test_and_exit: false,
+        stdin: None,
+        workers_set: false,
     }
 }
 
