@@ -1062,6 +1062,17 @@ fn events_from_record(
     } else if codec_name == "plain" {
         let mut codec = TextCodec::plain(settings.ecs);
         codec.decode(&record.value).map_err(fail)?
+    } else if codec_name == "avro" {
+        let codec = plugin
+            .args
+            .iter()
+            .find(|(key, _)| key == "codec")
+            .and_then(|(_, arg)| match arg {
+                Arg::Plugin(codec) => Some(codec),
+                _ => None,
+            })
+            .ok_or_else(|| fail(crate::avro::missing_schema()))?;
+        vec![crate::avro::decode(codec, &record.value, settings.ecs)?]
     } else {
         return Err(fail(format!(
             "plugin codec {codec_name} is not implemented"

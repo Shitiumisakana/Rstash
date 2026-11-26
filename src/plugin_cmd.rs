@@ -17,6 +17,12 @@ struct Gem {
 
 const GEMS: &[Gem] = &[
     Gem {
+        name: "logstash-codec-avro",
+        version: "3.5.0",
+        group: "codec",
+        children: &[],
+    },
+    Gem {
         name: "logstash-codec-dots",
         version: "3.0.6",
         group: "codec",

@@ -590,6 +590,9 @@ fn check_arg(arg: &Arg) -> Result<(), RunError> {
             if plugin.kind != Kind::Codec {
                 return Err(fail(unimplemented(plugin.kind, &plugin.name)));
             }
+            if plugin.name == "avro" {
+                crate::avro::prepare(plugin)?;
+            }
             Ok(())
         }
         Arg::Array(items) => {
@@ -795,6 +798,13 @@ pub(crate) fn encode_event(
     } else {
         match codec.name.as_str() {
             "plain" | "line" => event.plain_string(),
+            "avro" => {
+                let codec_plugin = codec
+                    .plugin
+                    .as_ref()
+                    .ok_or_else(|| fail(crate::avro::missing_schema()))?;
+                crate::avro::encode(codec_plugin, event)?
+            }
             name => crate::plugins::encode(name, &codec.delimiter, codec.metadata, event)?,
         }
     };
@@ -814,6 +824,7 @@ struct CodecSpec {
     delimiter: String,
     format: Option<String>,
     metadata: bool,
+    plugin: Option<Plugin>,
 }
 
 fn codec_name(plugin: &Plugin) -> Option<&str> {
@@ -831,18 +842,26 @@ fn codec_of(plugin: &Plugin, default_name: &str) -> Result<CodecSpec, RunError> 
             delimiter: "\n".to_string(),
             format: None,
             metadata: false,
+            plugin: None,
         }),
-        Some(Arg::String(name)) => Ok(CodecSpec {
-            name: name.clone(),
-            delimiter: "\n".to_string(),
-            format: None,
-            metadata: false,
-        }),
+        Some(Arg::String(name)) => {
+            if name == "avro" {
+                return Err(fail(crate::avro::missing_schema()));
+            }
+            Ok(CodecSpec {
+                name: name.clone(),
+                delimiter: "\n".to_string(),
+                format: None,
+                metadata: false,
+                plugin: None,
+            })
+        }
         Some(Arg::Plugin(codec)) => Ok(CodecSpec {
             name: codec.name.clone(),
             delimiter: arg_string(codec, "delimiter").unwrap_or_else(|| "\n".to_string()),
             format: arg_string(codec, "format"),
             metadata: arg_string(codec, "metadata").as_deref() == Some("true"),
+            plugin: Some(codec.clone()),
         }),
         Some(_) => Err(fail("codec must be a name or a codec block")),
     }
@@ -1503,6 +1522,7 @@ mod tests {
             delimiter: "\n".to_string(),
             format: None,
             metadata: false,
+            plugin: None,
         };
         let mut pending = String::new();
         let lines = codec_decode(&codec, &mut pending, "one\ntwo").expect("decode");

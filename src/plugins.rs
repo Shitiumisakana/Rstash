@@ -70,7 +70,7 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                 | "pipeline"
         ) | (
             Kind::Codec,
-            "dots" | "json" | "json_lines" | "rubydebug" | "multiline"
+            "avro" | "dots" | "json" | "json_lines" | "rubydebug" | "multiline"
         )
     )
 }
@@ -185,6 +185,11 @@ fn stdin_input(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunEr
     } else {
         std::io::read_to_string(std::io::stdin()).map_err(|error| fail(error.to_string()))?
     };
+    if codec_name(plugin) == "avro" {
+        let codec = codec_plugin(plugin).ok_or_else(|| fail(crate::avro::missing_schema()))?;
+        let event = crate::avro::decode(codec, text.as_bytes(), settings.ecs)?;
+        return decorate_stdin(vec![event], settings);
+    }
     if matches!(codec_name(plugin).as_str(), "json" | "json_lines") {
         return decode_events(&codec_name(plugin), &text);
     }
@@ -419,6 +424,19 @@ fn file_input(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunErr
     }
     let mut events = Vec::new();
     for chunk in read.chunks {
+        if let Some(codec) = codec_plugin(plugin)
+            && codec.name == "avro"
+        {
+            for line in chunk.text.split(&delimiter) {
+                if line.is_empty() {
+                    continue;
+                }
+                let mut event = crate::avro::decode(codec, line.as_bytes(), settings.ecs)?;
+                stamp_file_event(&mut event, &chunk.path, settings)?;
+                events.push(event);
+            }
+            continue;
+        }
         if let Some(codec) = codec_plugin(plugin)
             && codec.name == "multiline"
         {

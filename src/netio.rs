@@ -142,7 +142,24 @@ pub(crate) fn http_input(plugin: &Plugin, settings: &Settings) -> Result<Vec<Eve
             return Ok(());
         }
         let codec = codec_for_type(plugin, request.content_type.as_deref());
-        let mut decoded = decode_payload(codec, request.body.as_bytes())?;
+        let mut decoded = if codec == "avro" {
+            let block = plugin
+                .args
+                .iter()
+                .find(|(key, _)| key == "codec")
+                .and_then(|(_, arg)| match arg {
+                    Arg::Plugin(codec) => Some(codec),
+                    _ => None,
+                })
+                .ok_or_else(|| fail(crate::avro::missing_schema()))?;
+            vec![crate::avro::decode(
+                block,
+                request.body.as_bytes(),
+                settings.ecs,
+            )?]
+        } else {
+            decode_payload(codec, request.body.as_bytes())?
+        };
         for event in &mut decoded {
             stamp_http(event, settings, &peer.ip().to_string(), &request)?;
         }
@@ -471,6 +488,7 @@ fn codec_for_type(plugin: &Plugin, content_type: Option<&str>) -> &'static str {
         Some("line") => "line",
         Some("json") => "json",
         Some("json_lines") => "json_lines",
+        Some("avro") => "avro",
         _ => "plain",
     }
 }
@@ -484,6 +502,22 @@ fn events_from_bytes(
     kind: &str,
 ) -> Result<Vec<Event>, RunError> {
     let codec = codec_name(plugin).unwrap_or(if kind == "udp" { "plain" } else { "line" });
+    if codec == "avro" {
+        let block = plugin
+            .args
+            .iter()
+            .find(|(key, _)| key == "codec")
+            .and_then(|(_, arg)| match arg {
+                Arg::Plugin(codec) => Some(codec),
+                _ => None,
+            })
+            .ok_or_else(|| fail(crate::avro::missing_schema()))?;
+        let mut events = vec![crate::avro::decode(block, bytes, settings.ecs)?];
+        for event in &mut events {
+            stamp_peer(event, settings, ip.as_deref(), port, kind)?;
+        }
+        return Ok(events);
+    }
     let mut events = decode_payload(codec, bytes)?;
     for event in &mut events {
         stamp_peer(event, settings, ip.as_deref(), port, kind)?;
