@@ -6,6 +6,7 @@
 pub mod cli;
 
 mod api;
+mod bus;
 mod codec;
 mod digest;
 mod dlq;

@@ -37,6 +37,7 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                 | "elasticsearch"
                 | "jdbc"
                 | "kafka"
+                | "pipeline"
         ) | (
             Kind::Filter,
             "uuid"
@@ -58,7 +59,15 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                 | "elasticsearch"
         ) | (
             Kind::Output,
-            "null" | "sink" | "file" | "tcp" | "udp" | "http" | "elasticsearch" | "kafka"
+            "null"
+                | "sink"
+                | "file"
+                | "tcp"
+                | "udp"
+                | "http"
+                | "elasticsearch"
+                | "kafka"
+                | "pipeline"
         ) | (
             Kind::Codec,
             "dots" | "json" | "json_lines" | "rubydebug" | "multiline"

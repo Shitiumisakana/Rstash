@@ -120,24 +120,90 @@ pub fn run(config: &str, settings: &Settings) -> Result<RunResult, RunError> {
             events: Vec::new(),
         });
     }
-    execute(&pipeline, settings)
+    let launch = crate::bus::prepare(&[(settings.pipeline_id.clone(), pipeline.clone())])?;
+    let addresses = launch
+        .senders
+        .get(&settings.pipeline_id)
+        .cloned()
+        .unwrap_or_default();
+    execute(&pipeline, settings, launch.bus, addresses, true)
 }
 
-/// Run several pipelines. Each has its own queue, so events cannot cross.
+/// Run several pipelines. Separate pipelines share events only through
+/// `input` / `output` `pipeline` addresses. That bus runs the pipelines together.
 pub fn run_many(
     pipelines: &[(String, String)],
     settings: &Settings,
 ) -> Result<Vec<(String, RunResult)>, RunError> {
-    let mut results = Vec::new();
+    let mut compiled = Vec::new();
     for (id, config) in pipelines {
+        let pipeline =
+            compile_imperative(config, false).map_err(|error| fail(error.to_string()))?;
+        compiled.push((id.clone(), pipeline));
+    }
+    if settings.test_and_exit {
+        let mut results = Vec::new();
+        for (id, pipeline) in &compiled {
+            check_plugins(pipeline)?;
+            results.push((
+                id.clone(),
+                RunResult {
+                    stdout: String::new(),
+                    events: Vec::new(),
+                },
+            ));
+        }
+        return Ok(results);
+    }
+    let launch = crate::bus::prepare(&compiled)?;
+    if launch.bus.is_none() {
+        let mut results = Vec::new();
+        for (id, pipeline) in compiled {
+            let mut settings = settings.clone();
+            settings.pipeline_id = id.clone();
+            results.push((id, execute(&pipeline, &settings, None, Vec::new(), true)?));
+        }
+        return Ok(results);
+    }
+    let mut handles = Vec::new();
+    for (index, (id, pipeline)) in compiled.into_iter().enumerate() {
         let mut settings = settings.clone();
         settings.pipeline_id = id.clone();
-        results.push((id.clone(), run(config, &settings)?));
+        let bus = launch.bus.clone();
+        let addresses = launch.senders.get(&id).cloned().unwrap_or_default();
+        let serve_api = index == 0;
+        handles.push(thread::spawn(move || {
+            let result = execute(&pipeline, &settings, bus, addresses, serve_api);
+            (id, result)
+        }));
+    }
+    let mut results = Vec::new();
+    let mut failure = None;
+    for handle in handles {
+        let (id, result) = handle.join().expect("pipeline");
+        match result {
+            Ok(value) => results.push((id, value)),
+            Err(error) if failure.is_none() => failure = Some(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     Ok(results)
 }
 
-fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunError> {
+fn execute(
+    pipeline: &Pipeline,
+    settings: &Settings,
+    bus: Option<Arc<crate::bus::Bus>>,
+    sender_addresses: Vec<String>,
+    serve_api: bool,
+) -> Result<RunResult, RunError> {
+    let _finish = bus.as_ref().map(|bus| FinishSenders {
+        bus: Arc::clone(bus),
+        addresses: sender_addresses,
+    });
     check_plugins(pipeline)?;
     let inputs = input_plugins(&pipeline.input);
     if inputs.is_empty() {
@@ -161,8 +227,8 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
     }
     let live = Arc::new(live);
     let _api = match settings.api_port {
-        Some(port) => Some(crate::api::serve(port, Arc::clone(&live))?),
-        None => None,
+        Some(port) if serve_api => Some(crate::api::serve(port, Arc::clone(&live))?),
+        _ => None,
     };
     let shared = Arc::new(Shared {
         queue,
@@ -174,6 +240,7 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
         error: Mutex::new(None),
         disk: Mutex::new(disk),
         live,
+        bus,
     });
     if let Some(disk) = shared.disk.lock().expect("disk").as_ref() {
         for event in disk.unacked_events()? {
@@ -185,6 +252,13 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
         let shared = Arc::clone(&shared);
         let plugin = plugin.clone();
         producers.push(thread::spawn(move || {
+            if plugin.name == "pipeline" {
+                if let Err(error) = stream_pipeline_input(&plugin, &shared) {
+                    *shared.error.lock().expect("error") = Some(error.message);
+                }
+                shared.queue.close_input();
+                return;
+            }
             let produced = match plugin.name.as_str() {
                 "generator" => generator(&plugin, &shared.settings),
                 _ => crate::plugins::produce(&plugin, &shared.settings),
@@ -247,6 +321,41 @@ struct Shared {
     error: Mutex<Option<String>>,
     disk: Mutex<Option<crate::queue::DiskQueue>>,
     live: Arc<crate::api::Live>,
+    bus: Option<Arc<crate::bus::Bus>>,
+}
+
+struct FinishSenders {
+    bus: Arc<crate::bus::Bus>,
+    addresses: Vec<String>,
+}
+
+impl Drop for FinishSenders {
+    fn drop(&mut self) {
+        for address in &self.addresses {
+            self.bus.finish_sender(address);
+        }
+    }
+}
+
+fn stream_pipeline_input(plugin: &Plugin, shared: &Shared) -> Result<(), RunError> {
+    let bus = shared
+        .bus
+        .as_ref()
+        .ok_or_else(|| fail("pipeline input address has no sender in this process".to_string()))?;
+    let address = crate::bus::address(plugin)?;
+    bus.listen(&address)?;
+    while let Some(mut event) = bus.recv(&address)? {
+        crate::bus::decorate(plugin, &mut event)?;
+        if let Some(disk) = shared.disk.lock().expect("disk").as_mut() {
+            disk.append(&event)?;
+        }
+        shared
+            .live
+            .events_in
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        shared.queue.push(event);
+    }
+    Ok(())
 }
 
 fn worker(shared: &Shared) {
@@ -379,6 +488,14 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
         }
+        (Kind::Output, "pipeline") => {
+            let bus = shared.bus.as_ref().ok_or_else(|| {
+                fail("pipeline output send_to has no pipeline input in this process".to_string())
+            })?;
+            crate::bus::deliver(bus, plugin, &event)?;
+            shared.events.lock().expect("events").push(event.clone());
+            Ok(vec![event])
+        }
         (kind, name) => Err(fail(unimplemented(kind, name))),
     }
 }
@@ -443,6 +560,9 @@ fn check_statement(statement: &Statement) -> Result<(), RunError> {
             ) || crate::plugins::known(plugin.kind, &plugin.name);
             if !known {
                 return Err(fail(unimplemented(plugin.kind, &plugin.name)));
+            }
+            if plugin.name == "pipeline" && matches!(plugin.kind, Kind::Input | Kind::Output) {
+                crate::bus::validate(plugin)?;
             }
             if matches!(
                 (plugin.kind, plugin.name.as_str()),
@@ -1189,6 +1309,7 @@ pub fn apply_filter(config: &str, event: &mut Event) -> Result<(), RunError> {
         error: Mutex::new(None),
         disk: Mutex::new(None),
         live: Arc::new(crate::api::Live::from_settings(&Settings::default())),
+        bus: None,
     };
     let owned = std::mem::take(event);
     let mut produced = apply(&pipeline.filter, owned, &shared)?;
