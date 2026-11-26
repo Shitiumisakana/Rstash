@@ -36,6 +36,27 @@ fn message(event: &Event) -> String {
     }
 }
 
+fn udp_input_with_a_free_port() -> rstash::RunResult {
+    let reserved = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    let port = reserved.local_addr().expect("udp port").port();
+    drop(reserved);
+    thread::spawn(move || {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("udp sender");
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            let _ = socket.send_to(b"hello", ("127.0.0.1", port));
+            thread::sleep(Duration::from_millis(30));
+        }
+    });
+    run(
+        &format!(
+            r#"input {{ udp {{ host => "127.0.0.1" port => {port} codec => plain }} }} output {{ stdout {{ codec => plain }} }}"#
+        ),
+        &settings(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
 fn connect_retry(port: u16) -> TcpStream {
     let started = Instant::now();
     loop {
@@ -77,35 +98,32 @@ fn tcp_server_reads_a_line_and_records_the_peer() {
 fn tcp_client_output_writes_the_codec_bytes() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let got = Arc::new(Mutex::new(Vec::new()));
-    let slot = Arc::clone(&got);
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 256];
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(2) {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => bytes.extend_from_slice(&buffer[..size]),
-                Err(_) => {
-                    if !bytes.is_empty() {
-                        break;
-                    }
+    let handle = thread::spawn(move || {
+        run(
+            &format!(
+                r#"input {{ generator {{ count => 1 message => "ping" }} }} output {{ tcp {{ host => "127.0.0.1" port => {port} codec => line }} }}"#
+            ),
+            &settings(),
+        )
+        .unwrap();
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 256];
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => bytes.extend_from_slice(&buffer[..size]),
+            Err(_) => {
+                if bytes.ends_with(b" ping\n") {
+                    break;
                 }
             }
         }
-        *slot.lock().unwrap() = bytes;
-    });
-    run(
-        &format!(
-            r#"input {{ generator {{ count => 1 message => "ping" }} }} output {{ tcp {{ host => "127.0.0.1" port => {port} codec => line }} }}"#
-        ),
-        &settings(),
-    )
-    .unwrap();
-    let bytes = got.lock().unwrap().clone();
+    }
+    handle.join().unwrap();
     assert!(
         bytes.ends_with(b" ping\n"),
         "{}",
@@ -115,22 +133,7 @@ fn tcp_client_output_writes_the_codec_bytes() {
 
 #[test]
 fn udp_input_sets_host_and_output_sends_the_payload() {
-    let port = free_port();
-    thread::spawn(move || {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(2) {
-            let _ = socket.send_to(b"hello", ("127.0.0.1", port));
-            thread::sleep(Duration::from_millis(30));
-        }
-    });
-    let ran = run(
-        &format!(
-            r#"input {{ udp {{ host => "127.0.0.1" port => {port} codec => plain }} }} output {{ stdout {{ codec => plain }} }}"#
-        ),
-        &settings(),
-    )
-    .unwrap();
+    let ran = udp_input_with_a_free_port();
     assert!(!ran.events.is_empty());
     assert_eq!(message(&ran.events[0]), "hello");
     assert_eq!(
