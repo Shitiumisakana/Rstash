@@ -25,6 +25,7 @@ fn one_worker(ecs: Ecs) -> Settings {
         test_and_exit: false,
         stdin: None,
         workers_set: false,
+        path_data: None,
     }
 }
 

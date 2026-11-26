@@ -337,61 +337,96 @@ fn run_shell(command: &str) -> Result<ShellOutput, RunError> {
 }
 
 fn file_input(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunError> {
-    let path = arg_string(plugin, "path").ok_or_else(|| fail("file input requires path"))?;
-    let bytes = fs::read(&path).map_err(|error| fail(error.to_string()))?;
-    let text = String::from_utf8_lossy(&bytes);
-    let start = arg_string(plugin, "start_position").unwrap_or_else(|| "end".to_string());
-    let body = if start == "beginning" || arg_string(plugin, "mode").as_deref() == Some("read") {
-        text.as_ref()
-    } else if let Some(sincedb) = arg_string(plugin, "sincedb_path") {
-        let offset = fs::read_to_string(&sincedb)
-            .ok()
-            .and_then(|text| text.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        text.get(offset..).unwrap_or("")
-    } else {
-        ""
+    let paths = match arg(plugin, "path") {
+        Some(Arg::String(path)) => vec![path.clone()],
+        Some(Arg::Array(items)) => items.iter().map(arg_text).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(fail("file input requires path")),
     };
-    if let Some(sincedb) = arg_string(plugin, "sincedb_path") {
-        fs::write(&sincedb, bytes.len().to_string()).map_err(|error| fail(error.to_string()))?;
-    }
-    if let Some(codec) = codec_plugin(plugin)
-        && codec.name == "multiline"
-    {
-        let mut events = crate::grok::multiline_decode(codec, body, settings.ecs, true)?;
-        for event in &mut events {
-            event
-                .set_field("path", Value::from(path.as_str()))
-                .map_err(err)?;
-            if settings.ecs != Ecs::Disabled {
-                event
-                    .set_field("[log][file][path]", Value::from(path.as_str()))
-                    .map_err(err)?;
-            }
+    let mode = arg_string(plugin, "mode").unwrap_or_else(|| "tail".to_string());
+    let start = arg_string(plugin, "start_position").unwrap_or_else(|| "end".to_string());
+    let delimiter = arg_string(plugin, "delimiter").unwrap_or_else(|| "\n".to_string());
+    let action =
+        arg_string(plugin, "file_completed_action").unwrap_or_else(|| "delete".to_string());
+    let sincedb = arg_string(plugin, "sincedb_path");
+    let read = crate::filewatch::read_files(&crate::filewatch::ReadOptions {
+        paths: &paths,
+        mode: &mode,
+        start_position: &start,
+        sincedb_path: sincedb.as_deref(),
+        delimiter: &delimiter,
+        path_data: settings.path_data.as_deref(),
+        delete_when_done: mode == "read" && action.contains("delete"),
+    })?;
+    if mode == "read" && action.contains("log") {
+        let log_path = arg_string(plugin, "file_completed_log_path").ok_or_else(|| {
+            fail(
+                "The \"file_completed_log_path\" setting must be provided when the \"file_completed_action\" is set to \"log\" or \"log_and_delete\"",
+            )
+        })?;
+        if let Some(parent) = std::path::Path::new(&log_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|error| fail(error.to_string()))?;
         }
-        return Ok(events);
+        let mut lines = read.completed.join("\n");
+        if !lines.is_empty() {
+            lines.push('\n');
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| fail(error.to_string()))?;
+        file.write_all(lines.as_bytes())
+            .map_err(|error| fail(error.to_string()))?;
     }
     let mut events = Vec::new();
-    for line in body.split_inclusive('\n') {
-        let message = line.trim_end_matches(['\n', '\r']);
-        if message.is_empty() {
+    for chunk in read.chunks {
+        if let Some(codec) = codec_plugin(plugin)
+            && codec.name == "multiline"
+        {
+            for mut event in crate::grok::multiline_decode(codec, &chunk.text, settings.ecs, true)?
+            {
+                stamp_file_event(&mut event, &chunk.path, settings)?;
+                events.push(event);
+            }
             continue;
         }
-        let mut event = Event::new();
-        event
-            .set_field("message", Value::from(message))
-            .map_err(err)?;
-        event
-            .set_field("path", Value::from(path.as_str()))
-            .map_err(err)?;
-        if settings.ecs != Ecs::Disabled {
-            event
-                .set_field("[log][file][path]", Value::from(path.as_str()))
-                .map_err(err)?;
+        for line in chunk.text.split(&delimiter) {
+            if line.is_empty() {
+                continue;
+            }
+            let mut event = Event::new();
+            event.set_field("message", Value::from(line)).map_err(err)?;
+            stamp_file_event(&mut event, &chunk.path, settings)?;
+            events.push(event);
         }
-        events.push(event);
     }
     Ok(events)
+}
+
+fn stamp_file_event(event: &mut Event, path: &str, settings: &Settings) -> Result<(), RunError> {
+    let host = crate::run::hostname();
+    event
+        .set_field("[@metadata][path]", Value::from(path))
+        .map_err(err)?;
+    event
+        .set_field("[@metadata][host]", Value::from(host.as_str()))
+        .map_err(err)?;
+    if settings.ecs == Ecs::Disabled {
+        event.set_field("path", Value::from(path)).map_err(err)?;
+        event
+            .set_field("host", Value::from(host.as_str()))
+            .map_err(err)?;
+    } else {
+        event
+            .set_field("[log][file][path]", Value::from(path))
+            .map_err(err)?;
+        event
+            .set_field("[host][name]", Value::from(host.as_str()))
+            .map_err(err)?;
+    }
+    Ok(())
 }
 
 fn uuid_filter(plugin: &Plugin, mut event: Event) -> Result<Vec<Event>, RunError> {

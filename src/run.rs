@@ -36,6 +36,8 @@ pub struct Settings {
     pub stdin: Option<String>,
     /// True when `-w` or `pipeline.workers` in a settings file set the value.
     pub workers_set: bool,
+    /// `path.data`. The file input writes its sincedb under `plugins/inputs/file`.
+    pub path_data: Option<String>,
 }
 
 impl Default for Settings {
@@ -50,6 +52,7 @@ impl Default for Settings {
             test_and_exit: false,
             stdin: None,
             workers_set: false,
+            path_data: None,
         }
     }
 }

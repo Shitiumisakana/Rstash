@@ -17,6 +17,7 @@ fn settings() -> Settings {
         test_and_exit: false,
         stdin: None,
         workers_set: false,
+        path_data: None,
     }
 }
 

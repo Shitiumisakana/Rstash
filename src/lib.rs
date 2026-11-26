@@ -10,6 +10,7 @@ mod digest;
 mod error;
 mod event;
 mod field;
+mod filewatch;
 mod grok;
 mod lscl;
 mod mutate;
