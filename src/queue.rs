@@ -808,6 +808,7 @@ mod tests {
             path_dlq: None,
             dlq_max_bytes: 1024 * 1024 * 1024,
             dlq_storage_policy: String::from("drop_newer"),
+            api_port: None,
         };
         let ran = crate::run::run(
             r#"input { generator { count => 1 message => "queued" } } output { stdout { codec => plain } }"#,

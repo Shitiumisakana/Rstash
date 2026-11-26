@@ -1,4 +1,6 @@
-//! `logstash` flags this slice accepts: `-e`, `-f`, `-t`, `-w`, `-b`, and `--path.settings`.
+//! `logstash` flags this slice accepts: `-e`, `-f`, `-t`, `-w`, `-b`,
+//! `--path.settings`, `--api.http.port`, `--api.http.host`, and
+//! `--config.reload.automatic`.
 
 use std::io::Write;
 use std::path::Path;
@@ -13,6 +15,9 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
     let mut settings_path = None;
     let mut workers = None;
     let mut batch_size = None;
+    let mut api_port = None;
+    let mut api_host = None;
+    let mut reload_automatic = None;
     let mut index = 0;
     let mut test_and_exit = false;
     if args.first().map(String::as_str) == Some("pqcheck") {
@@ -59,6 +64,18 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
                 settings_path = Some(next()?);
                 index += 2;
             }
+            "--api.http.port" => {
+                api_port = Some(parse_u16(&next()?, "api.http.port")?);
+                index += 2;
+            }
+            "--api.http.host" => {
+                api_host = Some(next()?);
+                index += 2;
+            }
+            "--config.reload.automatic" => {
+                reload_automatic = Some(next()?);
+                index += 2;
+            }
             "-t" | "--config.test_and_exit" => {
                 test_and_exit = true;
                 index += 1;
@@ -89,6 +106,17 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
     }
     if let Some(batch_size) = batch_size {
         settings.batch_size = batch_size;
+    }
+    if let Some(port) = api_port {
+        settings.api_port = Some(port);
+    }
+    if let Some(host) = api_host
+        && !matches!(host.as_str(), "127.0.0.1" | "localhost")
+    {
+        return Err("api.http.host other than 127.0.0.1 is not implemented".to_string());
+    }
+    if reload_automatic.as_deref() == Some("true") {
+        return Err("pipeline reload is not implemented".to_string());
     }
     settings.test_and_exit = test_and_exit;
 
@@ -174,6 +202,11 @@ fn read_config_path(path: &Path) -> Result<String, String> {
         std::fs::read_to_string(path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))
     }
+}
+
+fn parse_u16(text: &str, name: &str) -> Result<u16, String> {
+    text.parse()
+        .map_err(|_| format!("{name} is not an integer: {text}"))
 }
 
 fn parse_usize(text: &str, name: &str) -> Result<usize, String> {

@@ -392,7 +392,12 @@ fn rows_to_events(plugin: &Plugin, rows: Vec<PgRow>) -> Result<Vec<Event>, RunEr
     let lower = flag(plugin, "lowercase_column_names").unwrap_or(true);
     let target = text(plugin, "target");
     let mut events = Vec::new();
-    for PgRow { names, cells, types } in rows {
+    for PgRow {
+        names,
+        cells,
+        types,
+    } in rows
+    {
         let mut columns = Vec::new();
         for ((name, cell), oid) in names.into_iter().zip(cells).zip(types) {
             let name = if lower {

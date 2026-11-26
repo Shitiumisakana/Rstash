@@ -54,6 +54,8 @@ pub struct Settings {
     pub dlq_max_bytes: u64,
     /// `dead_letter_queue.storage_policy`: `drop_newer` or `drop_older`.
     pub dlq_storage_policy: String,
+    /// `api.http.port`. `None` does not listen. Official Logstash listens by default.
+    pub api_port: Option<u16>,
 }
 
 impl Default for Settings {
@@ -77,6 +79,7 @@ impl Default for Settings {
             path_dlq: None,
             dlq_max_bytes: 1024 * 1024 * 1024,
             dlq_storage_policy: String::from("drop_newer"),
+            api_port: None,
         }
     }
 }
@@ -152,6 +155,15 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
     } else {
         None
     };
+    let mut live = crate::api::Live::from_settings(settings);
+    if settings.api_port.is_some() {
+        live.id = crate::api::node_id(settings.path_data.as_deref());
+    }
+    let live = Arc::new(live);
+    let _api = match settings.api_port {
+        Some(port) => Some(crate::api::serve(port, Arc::clone(&live))?),
+        None => None,
+    };
     let shared = Arc::new(Shared {
         queue,
         filter: pipeline.filter.clone(),
@@ -161,6 +173,7 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
         events: Mutex::new(Vec::new()),
         error: Mutex::new(None),
         disk: Mutex::new(disk),
+        live,
     });
     if let Some(disk) = shared.disk.lock().expect("disk").as_ref() {
         for event in disk.unacked_events()? {
@@ -185,6 +198,10 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
                             *shared.error.lock().expect("error") = Some(error.message);
                             break;
                         }
+                        shared
+                            .live
+                            .events_in
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         shared.queue.push(event);
                     }
                 }
@@ -229,6 +246,7 @@ struct Shared {
     events: Mutex<Vec<Event>>,
     error: Mutex<Option<String>>,
     disk: Mutex<Option<crate::queue::DiskQueue>>,
+    live: Arc<crate::api::Live>,
 }
 
 fn worker(shared: &Shared) {
@@ -240,9 +258,21 @@ fn worker(shared: &Shared) {
         for event in batch {
             match apply(&shared.filter, event, shared) {
                 Ok(events) => {
+                    shared
+                        .live
+                        .events_filtered
+                        .fetch_add(events.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     for event in events {
-                        if let Err(error) = apply(&shared.output, event, shared) {
-                            *shared.error.lock().expect("error") = Some(error.message);
+                        match apply(&shared.output, event, shared) {
+                            Ok(_) => {
+                                shared
+                                    .live
+                                    .events_out
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                *shared.error.lock().expect("error") = Some(error.message);
+                            }
                         }
                     }
                 }
@@ -1007,6 +1037,25 @@ pub fn apply_logstash_yml(settings: &mut Settings, text: &str) -> Result<(), Run
                 }
                 settings.dlq_storage_policy = value;
             }
+            "api.http.port" => {
+                settings.api_port = Some(
+                    value
+                        .parse()
+                        .map_err(|_| fail(format!("api.http.port is not an integer: {value}")))?,
+                );
+            }
+            "api.http.host" => {
+                if !matches!(value.as_str(), "127.0.0.1" | "localhost") {
+                    return Err(fail(
+                        "api.http.host other than 127.0.0.1 is not implemented",
+                    ));
+                }
+            }
+            "config.reload.automatic" => {
+                if value == "true" {
+                    return Err(fail("pipeline reload is not implemented"));
+                }
+            }
             "pipeline.ecs_compatibility" => {
                 settings.ecs = match value.as_str() {
                     "disabled" => Ecs::Disabled,
@@ -1139,6 +1188,7 @@ pub fn apply_filter(config: &str, event: &mut Event) -> Result<(), RunError> {
         events: Mutex::new(Vec::new()),
         error: Mutex::new(None),
         disk: Mutex::new(None),
+        live: Arc::new(crate::api::Live::from_settings(&Settings::default())),
     };
     let owned = std::mem::take(event);
     let mut produced = apply(&pipeline.filter, owned, &shared)?;

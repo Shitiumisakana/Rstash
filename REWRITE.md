@@ -2,7 +2,7 @@
 
 - 形态：兼容重实现。交付物是纯 Rust 源码和一个 Rust 二进制。进程里没有 JVM、没有 JRuby、没有 Ruby 解释器，也不去调用 `java`。
 - 主案例：Rspack。
-- 当前切片：第 5 到第 8 片已通过。波 A 到波 C 已通过（波 B 里除 grok 以外的过滤器仍是各自 gem 的一部分选项）。波 D 已通过。波 E 的持久队列和死信队列已接到管道上，限制写在波 E。波 F 的 elasticsearch、kafka 和 jdbc 的已实现部分已接上，限制写在波 F。下一位做波 G：监控 API、热加载、pipeline 输入输出。监控 API 不编造 JVM 堆、GC 和 hot threads。不要重写事件模型、LSCL 编译器，也不要重写已经能跑的内存管道。
+- 当前切片：第 5 到第 8 片已通过。波 A 到波 C 已通过（波 B 里除 grok 以外的过滤器仍是各自 gem 的一部分选项）。波 D 已通过。波 E 的持久队列和死信队列已接到管道上，限制写在波 E。波 F 的 elasticsearch、kafka 和 jdbc 的已实现部分已接上，限制写在波 F。波 G 的监控 API 已接上，限制写在有意差异和波 G。热加载只拒绝 `config.reload.automatic: true`，没有监视器。`pipeline` 输入输出还没做。不要重写事件模型、LSCL 编译器，也不要重写已经能跑的内存管道。
 - 上一片：第 2 到第 4 片一起验收。命令 `cargo test` 覆盖 event_fields、parse_sections、conditions、compile_graph。日期 2026-11-25。后又加了 `cargo test --test official`。
 - 官方测试：发行包里没有 JUnit / RSpec。源在 `elastic/logstash` tag `v9.5.2`，本机副本在 `target/upstream/logstash`（已 gitignore）。这些测试构造的是 `org.logstash.Event` 和 JRuby，不能直接对 `rstash` 执行。对照方式是把同一批配置和断言喂给 Rust，编译期望值由 9.5.2 的 `compile_imperative` 打到 `tests/fixtures/oracle/official_compiler.txt`。
 - `compiler_spec.rb` 和 `config_ast_spec.rb` 里能落到 LSCL 的配置共 83 条，期望值是 9.5.2 `compile_imperative` 的图文本。另外按原断言核对了语句上的 source 协议、id、行号、列号和插件原文，`config.support_escapes` 打开时参数值是处理后的字符串。`010` 按 Ruby `Integer()` 是八进制 8。
@@ -71,7 +71,7 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - Log4j：`tracing`。日志句子不是契约。
 - 内存队列：标准库。持久队列：`memmap2`，页格式对照旧文件和 `pqcheck`。死信队列同理。靠后的切片。
 - `logstash.yml`：serde_yaml 收成一个结构体，在 `main` 加载一次。密钥只来自环境变量或现有 keystore 文件，不写进仓库。
-- 监控 API：axum，路径和 JSON 字段用旧响应 fixture 锁。JVM 段在 Rust 进程里没有对应物，做这一片之前停下来确认，未确认不实现。
+- 监控 API：标准库 TCP。只在 `api.http.port` 有值时听 `127.0.0.1`，管道返回后关掉。JVM 堆、GC 和 hot threads 不编造。`/_node` 和 `/_node/stats` 不写 `jvm`。`/_node/hot_threads` 的 `threads` 是空数组。`/_health_report` 只有 `status: green`，没有指标树。
 - Elasticsearch / Kafka / JDBC：用纯 Rust 客户端说原来的协议。各算一片插件。
 - Grok：行为用 fixture 锁。正则库必须是纯 Rust。对不齐的 Oniguruma 语法记入有意差异，开工前问。
 - GeoIP：用纯 Rust 的 MaxMind 读取库。下载器属于 x-pack，更晚。
@@ -83,7 +83,7 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - 进程里不保留 Java、JRuby、Ruby。旧：插件是 `.java` / `.rb`，宿主是 JVM。新：同一行为由 Rust 实现，二进制不嵌入第二种语言。已确认。
 - 日志原文和异常类名。旧：Log4j / Ruby 异常。新：`tracing` 和 `Result`。原因：没有采集规则依赖原文。
 - 二进制名。旧命令是 `logstash`。新二进制叫 `rstash`，参数对齐。原因：仓库名是 Rstash。
-- 监控 API 里的 JVM 堆、GC、hot threads。旧 JSON 有 JVM 字段。新进程没有 JVM。未确认。实现 `/_node/stats` 之前必须问，未确认不实现。
+- 监控 API 不编造 JVM 堆、GC 和线程栈。旧 JSON 有 `jvm`，hot threads 是 JVM 转储。新响应省略 `jvm`，`hot_threads.threads` 是空数组。`os.name` 是 Rust 的 `std::env::consts::OS`，不是 Java 的 `Windows 10`。事件耗时字段是 0，因为没有采集。默认不监听：官方默认扫 `9600..9700`，短测试会占住端口。设置了端口才在这次 `run` 期间听 `127.0.0.1`，返回后停止。`?human` 仍返回 JSON。`config.reload.automatic: true` 报 `pipeline reload is not implemented`，没有文件监视。多个管道共用一个端口时，第二条绑不上。已确认。
 - `nand` / `xor` 和 `and` / `or` 混用时两边都拒绝。旧报错文本是 JRuby `Method#inspect`。新文本是 `ArgumentError: Unexpected operator nand` 或 `xor`。已确认：失败条件对齐，不复制 JVM 方法签名。
 - grok 的 `timeout_millis` 不打断匹配。旧实现用 Ruby `Timeout`。新实现把正则跑完。原因：没有单独的超时线程；跑不完的模式会一直占着这次调用。
 - `multiline` 的 `auto_flush_interval` 不是后台计时器。有限的 `file` 输入在结束时 flush；`stdin` 不 flush。`charset` 只认 `UTF-8`。
@@ -116,14 +116,14 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - 波 D：file、tcp、udp、http、beats。状态：通过，带下面的限制。sincedb 在插件里，不在 core。一行是 `inode major minor position changed_at path`；只有四列的旧行没有时间和路径。Windows 的 inode 是 `volumeSerial-fileIndexLow-fileIndexHigh`，设备号是 0。`mode => read` 从开头读，已有检查点就从检查点接着读，读完默认删文件（`file_completed_action => delete`）。`tail` 第一次见到文件时 `start_position => end` 停在文件末尾。这一趟读完就返回，不会一直 tail。`tcp` 输入默认 server，`port` 必填，默认 codec 是 `line`，ECS 关闭时写 `host`、`port` 和 `[@metadata][ip_address]`。`tcp` 输出默认 client，默认 codec 是 `json`。`udp` 输入默认 codec 是 `plain`，ECS 关闭时把来源地址写进 `host`，打开时写 `[host][ip]`。`udp` 输出的 `port` 先做 sprintf。`http` 输入默认 8080，`application/json` 按 json codec 解 body，`user` 设置时要 Basic 认证，应答默认 200。`http` 输出要 `url` 和 `http_method`。`beats` 收 lumberjack v2 的 `W` 和 `J` 帧，并回 `A` ack。验收 `cargo test --test file_sincedb --test netio`。
 - 波 E：持久队列页格式和 `pqcheck`/`pqrepair`，然后死信队列。状态：通过，带上面的限制。`queue.type: persisted` 把事件写成 Jackson CBOR，帧仍是 `MmapPageIOV2`。页写满后序号接着上一页，不从 1 重新开始；整页 ack 掉、尾页被删掉之后，新页的序号再从 1 开始。再次打开一个还有元素的尾页时，先把尾页封成 `checkpoint.N`，再开一个空的下一页。`rstash pqcheck 目录` 读 `checkpoint.head` 并校验它指向的那一页。`rstash pqrepair 目录` 按 `PqRepair`：删 `checkpoint.*.tmp`，删已经完全确认的页和检查点，删没有页的检查点，删短于 18 字节的页，并为除最高页以外缺检查点的页按页字节重建检查点。死信队列段是 `N.log`：版本字节 `1`，记录头 13 字节（`c`/`s`/`m`/`e`、长度、总长度或 -1、CRC32），负载是 `DLQEntry`。`dead_letter_queue` 输入读 `path/pipeline_id` 下已有的段，把 `plugin_type`、`plugin_id`、`reason`、`entry_time` 写进 `[@metadata][dead_letter_queue]`。`commit_offsets` 默认 true，sincedb 是版本字符 `1`、路径、偏移。`clean_consumed` 要求同时打开 `commit_offsets`。9.5.2 的 `Event.deserialize` 能读这里写出的队列事件，`DeadLetterQueueReader` 能读这里写出的段。验收 `cargo test queue::` 和 `cargo test dlq::`。
 - 波 F：elasticsearch、kafka、jdbc 的协议行为。状态：输出、输入、过滤器、kafka 输出和 jdbc 的 PostgreSQL 一次性查询已接上，限制见上。elasticsearch 输出是 logstash-output-elasticsearch 12.1.6。ECS 打开且 `data_stream` 为 `auto` 时，bulk 动作是 `create`，索引是 `logs-generic-default`，文档补上 `data_stream.type/dataset/namespace`。ECS 关闭且索引仍是默认值时，`ilm_enabled => auto` 把 `_index` 改成别名 `logstash`，HEAD/PUT 发行包里的 composable 模板，创建 `<logstash-{now/d}-000001>` 和策略 `logstash-policy`。动作行保留 JrJackson 写出的 `"_id":null` 和 `"routing":null`。模板 JSON 来自该 gem 的 `templates/ecs-*`。文档状态 400/404 在死信队列打开时写入 DLQ，否则丢掉；409 丢掉。其它状态让这次运行失败。输入是 5.3.2：Elasticsearch 8 用 point-in-time 和 `search_after`，7 用 scroll，聚合、ES|QL、`docinfo` 和 `tracking_field` 会写出事件。过滤器是 4.4.1：DSL 查询字符串走 `q`，`query_template` 走 JSON body，失败打标签。kafka 输出是 12.1.5 的明文 Produce，输入是同版本的一次 Fetch。jdbc 是 5.6.4 里没有调度的那一次查询。验收 `cargo test --test elasticsearch --test elasticsearch_query --test kafka --test jdbc` 和 `cargo test kafka::`。
-- 波 G：监控 API（先确认 JVM 段）、热加载、`pipeline` 输入输出。
+- 波 G：监控 API、热加载、`pipeline` 输入输出。状态：监控 API 已接上，限制见上。`GET /` 带 9.5.2 的 `build_date` `2026-08-17T18:16:06+00:00`、`build_sha` `81753940099b4c9df5dba0da3fe6adb2f190a880`、`build_snapshot` false，并合并节点元数据。`/_node` 有 pipelines 和 os，没有 jvm。`/_node/stats` 有这次运行实际数过的 `events.in`、`events.filtered`、`events.out`，没有 jvm 和 flow。`events.in` 只数这次输入推进队列的事件，不数磁盘回放。热加载没有监视器。`pipeline` 输入输出还没做。验收 `cargo test --test api`。
 - 波 H：plugin 子命令、keystore、x-pack。Gemfile 里其余插件按这个顺序继续，直到清单清空。
 
 ## 插件清单
 
 已对齐：`generator`、`stdout`（codec 可以是 `plain`、`line`、`json`、`json_lines`、`dots`、`rubydebug`；缺省是 `rubydebug`）、`plain`、`line`、`drop`、`mutate` 3.6.0、`stdin`、`dots`、`sink`、`uuid`、`json` 过滤器和 codec、`json_lines`、`multiline`（见波 C）、`kv`、`dissect`、`csv`、`date`、`clone`、`split`、`prune`、`fingerprint`（SHA1/SHA256/UUID/PUNCTUATION）、`urldecode`、`truncate`、`syslog_pri`、`de_dot`、`anonymize`、`sleep`、`heartbeat`（`count` 必须是非负整数；`-1` 会一直跑，这里直接报错）、`exec`（要 `interval`，命令跑一次就结束；`schedule` 报未实现）、`file` 输入（官方 sincedb 文本；`mode => read` 或 tail 的一次读取；codec 可以是 `multiline`）和 `file` 输出（追加写）、`tcp` 输入输出、`udp` 输入输出、`http` 输入输出、`beats` 输入（见波 D）、持久队列（`queue.type: persisted`）、`pqcheck`、`pqrepair`、`dead_letter_queue` 输入（见波 E）、`elasticsearch` 输出、输入和过滤器（见波 F）、`kafka` 输入和输出（明文，输入只拉一次）、`jdbc` 输入（只做 PostgreSQL 的一次性查询）。`null` 与 `sink` 一样不写 stdout。`grok` 展开 patterns-core 4.3.4 的全部模式。
 
-未实现（出现在配置里必须报错并退出非 0）：上面没有点名的 Gemfile 插件，包括 jdbc 的非 PostgreSQL 驱动、elasticsearch 过滤器的 ES|QL、监控 API、热加载、`pipeline` 输入输出、plugin 子命令、keystore、x-pack。`exec` 的 cron、`heartbeat` 的无限循环、file 的持续 tail、这些网络插件的 TLS，也还没有。input 段里的 `if` 报未实现，不猜。
+未实现（出现在配置里必须报错并退出非 0）：上面没有点名的 Gemfile 插件，包括 jdbc 的非 PostgreSQL 驱动、elasticsearch 过滤器的 ES|QL、热加载的文件监视、`pipeline` 输入输出、plugin 子命令、keystore、x-pack。`exec` 的 cron、`heartbeat` 的无限循环、file 的持续 tail、这些网络插件的 TLS，也还没有。input 段里的 `if` 报未实现，不猜。
 
 ## 不做
 
@@ -131,10 +131,10 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 - 不把会编译 C 或 C++ 的 crate 写进 `Cargo.toml`。某一片做不到纯 Rust 时先问，不自行加 C 依赖。
 - 不按 Java 包建一排空 crate，不写 DI 容器或注解扫描。
 - 不在第 1 片引入 tokio、axum、clap。
-- 不把持久队列、监控 API、x-pack 提前做完。
+- 不把 x-pack 提前做完。监控 API 不是常驻 agent，也没有 JVM 指标。
 - 不修改旧 Logstash 目录里的任何文件。旧目录只在开发时当对照。跑预言机时 `--path.data` 和 `--path.logs` 指向本仓库 `target/`，避免写入发行包。
 - 发现旧行为像 bug 时记入有意差异，未确认不改。
 
 ## Git
 
-远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `b6f57e6`。这一片补上 kafka 输入的一次明文 Fetch 和 OffsetCommit。监控 API 还没做。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
+远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `7d92d3b`。这一片接上监控 API：只在 `api.http.port` 有值时听 `127.0.0.1`，省略 `jvm`，hot threads 是空数组。热加载和 `pipeline` 输入输出还没做。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。

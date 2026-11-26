@@ -5,6 +5,7 @@
 
 pub mod cli;
 
+mod api;
 mod codec;
 mod digest;
 mod dlq;
