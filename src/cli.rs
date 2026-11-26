@@ -1,6 +1,7 @@
 //! `logstash` flags this slice accepts: `-e`, `-f`, `-t`, `-w`, `-b`,
 //! `--path.settings`, `--api.http.port`, `--api.http.host`, and
-//! `--config.reload.automatic`.
+//! `--config.reload.automatic`. Subcommands: `pqcheck`, `pqrepair`, `plugin`,
+//! `keystore`.
 
 use std::io::Write;
 use std::path::Path;
@@ -20,6 +21,16 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
     let mut reload_automatic = None;
     let mut index = 0;
     let mut test_and_exit = false;
+    if args.first().map(String::as_str) == Some("plugin") {
+        let text = crate::plugin_cmd::execute(&args[1..])?;
+        let _ = write!(stdout, "{text}");
+        return Ok(0);
+    }
+    if args.first().map(String::as_str) == Some("keystore") {
+        let text = crate::keystore::execute(&args[1..])?;
+        let _ = write!(stdout, "{text}");
+        return Ok(0);
+    }
     if args.first().map(String::as_str) == Some("pqcheck") {
         let path = args
             .get(1)
