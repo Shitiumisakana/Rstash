@@ -34,6 +34,14 @@ impl Event {
         event
     }
 
+    pub(crate) fn field_map(&self) -> &Map {
+        &self.data
+    }
+
+    pub(crate) fn metadata_map(&self) -> &Map {
+        &self.metadata
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled
     }

@@ -18,6 +18,14 @@ fn settings() -> Settings {
         stdin: None,
         workers_set: false,
         path_data: None,
+        path_queue: None,
+        persisted_queue: false,
+        queue_page_capacity: 64 * 1024 * 1024,
+        pipeline_id: String::from("main"),
+        dlq_enabled: false,
+        path_dlq: None,
+        dlq_max_bytes: 1024 * 1024 * 1024,
+        dlq_storage_policy: String::from("drop_newer"),
     }
 }
 

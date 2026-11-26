@@ -25,7 +25,15 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
         (kind, name),
         (
             Kind::Input,
-            "stdin" | "heartbeat" | "exec" | "file" | "tcp" | "udp" | "http" | "beats"
+            "stdin"
+                | "heartbeat"
+                | "exec"
+                | "file"
+                | "tcp"
+                | "udp"
+                | "http"
+                | "beats"
+                | "dead_letter_queue"
         ) | (
             Kind::Filter,
             "uuid"
@@ -64,6 +72,7 @@ pub(crate) fn produce(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>
         "udp" => crate::netio::udp_input(plugin, settings),
         "http" => crate::netio::http_input(plugin, settings),
         "beats" => crate::netio::beats_input(plugin, settings),
+        "dead_letter_queue" => dlq_input(plugin, settings),
         other => Err(fail(format!("plugin input {other} is not implemented"))),
     }
 }
@@ -1419,6 +1428,129 @@ fn decorate_stdin(events: Vec<Event>, settings: &Settings) -> Result<Vec<Event>,
         decorated.push(event);
     }
     Ok(decorated)
+}
+
+fn dlq_input(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunError> {
+    let path =
+        arg_string(plugin, "path").ok_or_else(|| fail("dead_letter_queue path is required"))?;
+    let pipeline_id = arg_string(plugin, "pipeline_id").unwrap_or_else(|| String::from("main"));
+    let commit = arg_bool_default(plugin, "commit_offsets", true);
+    let clean = arg_bool(plugin, "clean_consumed");
+    if clean && !commit {
+        return Err(fail(
+            "enabling clean_consumed requires commit_offsets to also be enabled",
+        ));
+    }
+    let sincedb = match arg_string(plugin, "sincedb_path") {
+        Some(value) => {
+            if std::path::Path::new(&value).is_dir() {
+                return Err(fail(format!(
+                    "The \"sincedb_path\" argument must point to a file, received a directory: \"{value}\""
+                )));
+            }
+            Some(std::path::PathBuf::from(value))
+        }
+        None if commit => {
+            let data = settings.path_data.as_deref().ok_or_else(|| {
+                fail("dead_letter_queue sincedb requires path.data or sincedb_path")
+            })?;
+            let digest = crate::digest::md5_hex(path.as_bytes());
+            Some(
+                std::path::PathBuf::from(data)
+                    .join("plugins")
+                    .join("inputs")
+                    .join("dead_letter_queue")
+                    .join(&pipeline_id)
+                    .join(format!(".sincedb_{digest}")),
+            )
+        }
+        None => None,
+    };
+    let dir = std::path::PathBuf::from(&path).join(pipeline_id);
+    let saved = match &sincedb {
+        Some(sincedb) => crate::dlq::read_sincedb(sincedb)?,
+        None => None,
+    };
+    let (segment, offset) = match &saved {
+        Some((segment, offset)) => (Some(segment.as_path()), *offset),
+        None => (None, 0),
+    };
+    let (records, last, end) = crate::dlq::read_records_from(&dir, segment, offset)?;
+    if commit
+        && let Some(sincedb) = &sincedb
+        && let Some(last) = &last
+    {
+        crate::dlq::write_sincedb(sincedb, last, end)?;
+    }
+    if clean && let Some(last) = &last {
+        let length = std::fs::metadata(last).map(|meta| meta.len()).unwrap_or(0);
+        for segment_path in crate::dlq::segment_paths(&dir)? {
+            let finished = &segment_path == last && end >= length;
+            let earlier = segment_number(&segment_path) < segment_number(last);
+            if earlier || finished {
+                let _ = std::fs::remove_file(segment_path);
+            }
+        }
+    }
+    let start = arg_string(plugin, "start_timestamp");
+    let mut events = Vec::new();
+    for record in records {
+        if let Some(start) = &start
+            && timestamp_before(&record.entry_time, start)
+        {
+            continue;
+        }
+        let mut event = record.event;
+        event
+            .set_field(
+                "[@metadata][dead_letter_queue][plugin_type]",
+                Value::from(record.plugin_type),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        event
+            .set_field(
+                "[@metadata][dead_letter_queue][plugin_id]",
+                Value::from(record.plugin_id),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        event
+            .set_field(
+                "[@metadata][dead_letter_queue][reason]",
+                Value::from(record.reason),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        event
+            .set_field(
+                "[@metadata][dead_letter_queue][entry_time]",
+                Value::from(record.entry_time),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn segment_number(path: &std::path::Path) -> u32 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".log"))
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(0)
+}
+
+fn timestamp_before(entry: &str, start: &str) -> bool {
+    let start = if start.ends_with('Z') || start.contains('+') {
+        start.to_string()
+    } else {
+        format!("{start}Z")
+    };
+    match (
+        DateTime::parse_from_rfc3339(entry),
+        DateTime::parse_from_rfc3339(&start),
+    ) {
+        (Ok(entry), Ok(start)) => entry < start,
+        _ => false,
+    }
 }
 
 fn codec_plugin(plugin: &Plugin) -> Option<&Plugin> {

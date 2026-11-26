@@ -38,6 +38,22 @@ pub struct Settings {
     pub workers_set: bool,
     /// `path.data`. The file input writes its sincedb under `plugins/inputs/file`.
     pub path_data: Option<String>,
+    /// `path.queue`. Defaults to `path.data/queue` when the queue is persisted.
+    pub path_queue: Option<String>,
+    /// `queue.type`. `persisted` writes `MmapPageIOV2` pages under the queue path.
+    pub persisted_queue: bool,
+    /// `queue.page_capacity`, in bytes. The 9.5.2 default is 64 MiB.
+    pub queue_page_capacity: usize,
+    /// Directory name under the queue path. `run_many` sets this from `pipeline.id`.
+    pub pipeline_id: String,
+    /// `dead_letter_queue.enable`.
+    pub dlq_enabled: bool,
+    /// `path.dead_letter_queue`. Defaults to `path.data/dead_letter_queue`.
+    pub path_dlq: Option<String>,
+    /// `dead_letter_queue.max_bytes`. The 9.5.2 default is 1024mb.
+    pub dlq_max_bytes: u64,
+    /// `dead_letter_queue.storage_policy`: `drop_newer` or `drop_older`.
+    pub dlq_storage_policy: String,
 }
 
 impl Default for Settings {
@@ -53,6 +69,14 @@ impl Default for Settings {
             stdin: None,
             workers_set: false,
             path_data: None,
+            path_queue: None,
+            persisted_queue: false,
+            queue_page_capacity: 64 * 1024 * 1024,
+            pipeline_id: String::from("main"),
+            dlq_enabled: false,
+            path_dlq: None,
+            dlq_max_bytes: 1024 * 1024 * 1024,
+            dlq_storage_policy: String::from("drop_newer"),
         }
     }
 }
@@ -103,7 +127,9 @@ pub fn run_many(
 ) -> Result<Vec<(String, RunResult)>, RunError> {
     let mut results = Vec::new();
     for (id, config) in pipelines {
-        results.push((id.clone(), run(config, settings)?));
+        let mut settings = settings.clone();
+        settings.pipeline_id = id.clone();
+        results.push((id.clone(), run(config, &settings)?));
     }
     Ok(results)
 }
@@ -118,6 +144,14 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
         });
     }
     let queue = Queue::new(inputs.len());
+    let disk = if settings.persisted_queue {
+        Some(crate::queue::DiskQueue::open(
+            &queue_dir(settings)?,
+            settings.queue_page_capacity,
+        )?)
+    } else {
+        None
+    };
     let shared = Arc::new(Shared {
         queue,
         filter: pipeline.filter.clone(),
@@ -126,7 +160,13 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
         stdout: Mutex::new(String::new()),
         events: Mutex::new(Vec::new()),
         error: Mutex::new(None),
+        disk: Mutex::new(disk),
     });
+    if let Some(disk) = shared.disk.lock().expect("disk").as_ref() {
+        for event in disk.unacked_events()? {
+            shared.queue.push(event);
+        }
+    }
     let mut producers = Vec::new();
     for plugin in inputs {
         let shared = Arc::clone(&shared);
@@ -139,6 +179,12 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
             match produced {
                 Ok(events) => {
                     for event in events {
+                        if let Some(disk) = shared.disk.lock().expect("disk").as_mut()
+                            && let Err(error) = disk.append(&event)
+                        {
+                            *shared.error.lock().expect("error") = Some(error.message);
+                            break;
+                        }
                         shared.queue.push(event);
                     }
                 }
@@ -164,6 +210,10 @@ fn execute(pipeline: &Pipeline, settings: &Settings) -> Result<RunResult, RunErr
     if let Some(message) = shared.error.lock().expect("error").clone() {
         return Err(fail(message));
     }
+    if let Some(disk) = shared.disk.lock().expect("disk").as_mut() {
+        let pending = disk.unacked_events()?.len();
+        disk.ack(pending)?;
+    }
     Ok(RunResult {
         stdout: shared.stdout.lock().expect("stdout").clone(),
         events: shared.events.lock().expect("events").clone(),
@@ -178,6 +228,7 @@ struct Shared {
     stdout: Mutex<String>,
     events: Mutex<Vec<Event>>,
     error: Mutex<Option<String>>,
+    disk: Mutex<Option<crate::queue::DiskQueue>>,
 }
 
 fn worker(shared: &Shared) {
@@ -906,6 +957,44 @@ pub fn apply_logstash_yml(settings: &mut Settings, text: &str) -> Result<(), Run
                 })?;
                 settings.batch_delay = Duration::from_millis(millis);
             }
+            "queue.type" => {
+                settings.persisted_queue = match value.as_str() {
+                    "memory" => false,
+                    "persisted" => true,
+                    other => {
+                        return Err(fail(format!("queue.type {other} is not implemented")));
+                    }
+                };
+            }
+            "queue.page_capacity" => {
+                settings.queue_page_capacity = parse_byte_size(&value)?;
+            }
+            "queue.compression" => {
+                if !matches!(value.as_str(), "disabled" | "none") {
+                    return Err(fail(format!(
+                        "queue.compression {value} is not implemented"
+                    )));
+                }
+            }
+            "path.data" => settings.path_data = Some(value),
+            "path.queue" => settings.path_queue = Some(value),
+            "path.dead_letter_queue" => settings.path_dlq = Some(value),
+            "dead_letter_queue.enable" => {
+                settings.dlq_enabled = matches!(value.as_str(), "true");
+            }
+            "dead_letter_queue.max_bytes" => {
+                settings.dlq_max_bytes = u64::try_from(parse_byte_size(&value)?).map_err(|_| {
+                    fail(format!("dead_letter_queue.max_bytes is too large: {value}"))
+                })?;
+            }
+            "dead_letter_queue.storage_policy" => {
+                if !matches!(value.as_str(), "drop_newer" | "drop_older") {
+                    return Err(fail(format!(
+                        "dead_letter_queue.storage_policy {value} is not implemented"
+                    )));
+                }
+                settings.dlq_storage_policy = value;
+            }
             "pipeline.ecs_compatibility" => {
                 settings.ecs = match value.as_str() {
                     "disabled" => Ecs::Disabled,
@@ -1037,6 +1126,7 @@ pub fn apply_filter(config: &str, event: &mut Event) -> Result<(), RunError> {
         stdout: Mutex::new(String::new()),
         events: Mutex::new(Vec::new()),
         error: Mutex::new(None),
+        disk: Mutex::new(None),
     };
     let owned = std::mem::take(event);
     let mut produced = apply(&pipeline.filter, owned, &shared)?;
@@ -1074,6 +1164,35 @@ fn assign_pipeline(pipeline: &mut PipelineConfig, line: &str) -> Result<(), RunE
         }
     }
     Ok(())
+}
+
+fn queue_dir(settings: &Settings) -> Result<std::path::PathBuf, RunError> {
+    let root = if let Some(path) = &settings.path_queue {
+        std::path::PathBuf::from(path)
+    } else if let Some(path) = &settings.path_data {
+        std::path::PathBuf::from(path).join("queue")
+    } else {
+        return Err(fail("persisted queue requires path.data or path.queue"));
+    };
+    Ok(root.join(&settings.pipeline_id))
+}
+
+fn parse_byte_size(value: &str) -> Result<usize, RunError> {
+    let text = value.trim().to_ascii_lowercase();
+    let (number, factor) = if let Some(number) = text.strip_suffix("kb") {
+        (number, 1024usize)
+    } else if let Some(number) = text.strip_suffix("mb") {
+        (number, 1024 * 1024)
+    } else if let Some(number) = text.strip_suffix("gb") {
+        (number, 1024 * 1024 * 1024)
+    } else {
+        (text.as_str(), 1)
+    };
+    let number: usize = number
+        .trim()
+        .parse()
+        .map_err(|_| fail(format!("queue.page_capacity is not a size: {value}")))?;
+    Ok(number.saturating_mul(factor))
 }
 
 fn strip_yaml_comment(line: &str) -> &str {

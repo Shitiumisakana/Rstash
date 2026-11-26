@@ -7,6 +7,7 @@ pub mod cli;
 
 mod codec;
 mod digest;
+mod dlq;
 mod error;
 mod event;
 mod field;
@@ -18,6 +19,7 @@ mod netio;
 mod pattern_files;
 mod plugins;
 mod queue;
+mod queue_codec;
 mod run;
 mod timefmt;
 mod value;
@@ -29,6 +31,7 @@ pub use lscl::{
 };
 
 pub use codec::TextCodec;
+pub use dlq::write_entry;
 pub use error::EventError;
 pub use event::Event;
 pub use field::{
@@ -37,7 +40,7 @@ pub use field::{
 };
 pub use mutate::parse_signed_hex_str;
 pub use queue::{
-    Checkpoint, check_directory, read_checkpoint, read_page, write_checkpoint, write_page,
+    Checkpoint, check_directory, read_checkpoint, read_page, repair, write_checkpoint, write_page,
 };
 pub use run::{
     Ecs, PipelineConfig, RunError, RunResult, Settings, apply_filter, apply_logstash_yml,

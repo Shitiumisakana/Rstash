@@ -23,6 +23,14 @@ pub fn execute(args: &[String], stdout: &mut dyn Write) -> Result<i32, String> {
         let _ = writeln!(stdout, "OK");
         return Ok(0);
     }
+    if args.first().map(String::as_str) == Some("pqrepair") {
+        let path = args
+            .get(1)
+            .ok_or_else(|| "No queue directory given.".to_string())?;
+        crate::queue::repair(Path::new(path)).map_err(show)?;
+        let _ = writeln!(stdout, "Repair is done");
+        return Ok(0);
+    }
     while index < args.len() {
         let arg = args[index].as_str();
         let next = || {
