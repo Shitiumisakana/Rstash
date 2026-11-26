@@ -344,6 +344,11 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
         }
+        (Kind::Output, "kafka") => {
+            crate::kafka::send(plugin, &event)?;
+            shared.events.lock().expect("events").push(event);
+            Ok(Vec::new())
+        }
         (kind, name) => Err(fail(unimplemented(kind, name))),
     }
 }
@@ -410,7 +415,10 @@ fn check_statement(statement: &Statement) -> Result<(), RunError> {
                 return Err(fail(unimplemented(plugin.kind, &plugin.name)));
             }
             if plugin.kind == Kind::Output
-                && matches!(plugin.name.as_str(), "stdout" | "file" | "tcp" | "udp")
+                && matches!(
+                    plugin.name.as_str(),
+                    "stdout" | "file" | "tcp" | "udp" | "kafka"
+                )
                 && let Some(name) = codec_name(plugin)
                 && !codec_known(name)
             {

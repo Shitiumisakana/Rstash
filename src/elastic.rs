@@ -111,11 +111,11 @@ pub(crate) fn send(plugin: &Plugin, event: &Event, settings: &Settings) -> Resul
     accept_bulk(&text, event, settings, plugin)
 }
 
-struct Cluster {
-    number: String,
-    major: u64,
-    minor: u64,
-    serverless: bool,
+pub(crate) struct Cluster {
+    pub(crate) number: String,
+    pub(crate) major: u64,
+    pub(crate) minor: u64,
+    pub(crate) serverless: bool,
 }
 
 struct Config {
@@ -155,25 +155,25 @@ struct Config {
     ecs: Ecs,
 }
 
-struct Endpoint {
-    host: String,
-    port: u16,
-    prefix: String,
-    scheme: String,
-    user: Option<String>,
-    password: Option<String>,
+pub(crate) struct Endpoint {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) prefix: String,
+    pub(crate) scheme: String,
+    pub(crate) user: Option<String>,
+    pub(crate) password: Option<String>,
 }
 
 impl Endpoint {
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}://{}:{}{}", self.scheme, self.host, self.port, path)
     }
 }
 
-struct Response {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Config {
@@ -542,7 +542,7 @@ fn endpoints(plugin: &Plugin) -> Result<Vec<Endpoint>, RunError> {
     Ok(hosts)
 }
 
-fn parse_endpoint(raw: &str) -> Result<Endpoint, RunError> {
+pub(crate) fn parse_endpoint(raw: &str) -> Result<Endpoint, RunError> {
     let (scheme, rest) = if let Some(rest) = raw.strip_prefix("http://") {
         ("http", rest)
     } else if let Some(rest) = raw.strip_prefix("https://") {
@@ -610,7 +610,7 @@ fn authorization(plugin: &Plugin, host: &Endpoint) -> Result<Option<String>, Run
     }
 }
 
-fn cluster_info(response: &Response) -> Result<Cluster, RunError> {
+pub(crate) fn cluster_info(response: &Response) -> Result<Cluster, RunError> {
     let text = String::from_utf8_lossy(&response.body);
     let value: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| fail(error.to_string()))?;
@@ -1217,7 +1217,7 @@ fn dlq_directory(settings: &Settings) -> Result<PathBuf, RunError> {
     Ok(root.join(&settings.pipeline_id))
 }
 
-fn http(
+pub(crate) fn http(
     host: &Endpoint,
     auth: &Option<String>,
     method: &str,
@@ -1373,7 +1373,7 @@ fn decode_chunks(mut rest: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn header(response: &Response, name: &str) -> Option<String> {
+pub(crate) fn header(response: &Response, name: &str) -> Option<String> {
     response
         .headers
         .iter()
@@ -1381,7 +1381,7 @@ fn header(response: &Response, name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
-fn root_path(prefix: &str) -> String {
+pub(crate) fn root_path(prefix: &str) -> String {
     if prefix.is_empty() {
         "/".to_string()
     } else {
@@ -1389,7 +1389,7 @@ fn root_path(prefix: &str) -> String {
     }
 }
 
-fn join_path(prefix: &str, path: &str) -> String {
+pub(crate) fn join_path(prefix: &str, path: &str) -> String {
     let path = path.trim_start_matches('/');
     if prefix.is_empty() {
         format!("/{path}")
@@ -1398,7 +1398,7 @@ fn join_path(prefix: &str, path: &str) -> String {
     }
 }
 
-fn cgi_escape(value: &str) -> String {
+pub(crate) fn cgi_escape(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
@@ -1432,7 +1432,7 @@ fn gzip_store(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn base64(data: &[u8]) -> String {
+pub(crate) fn base64(data: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     let mut index = 0;

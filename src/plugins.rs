@@ -34,6 +34,8 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                 | "http"
                 | "beats"
                 | "dead_letter_queue"
+                | "elasticsearch"
+                | "jdbc"
         ) | (
             Kind::Filter,
             "uuid"
@@ -52,9 +54,10 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                 | "kv"
                 | "fingerprint"
                 | "sleep"
+                | "elasticsearch"
         ) | (
             Kind::Output,
-            "null" | "sink" | "file" | "tcp" | "udp" | "http" | "elasticsearch"
+            "null" | "sink" | "file" | "tcp" | "udp" | "http" | "elasticsearch" | "kafka"
         ) | (
             Kind::Codec,
             "dots" | "json" | "json_lines" | "rubydebug" | "multiline"
@@ -73,6 +76,8 @@ pub(crate) fn produce(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>
         "http" => crate::netio::http_input(plugin, settings),
         "beats" => crate::netio::beats_input(plugin, settings),
         "dead_letter_queue" => dlq_input(plugin, settings),
+        "elasticsearch" => crate::elastic_query::read(plugin, settings),
+        "jdbc" => crate::jdbc::read(plugin, settings),
         other => Err(fail(format!("plugin input {other} is not implemented"))),
     }
 }
@@ -99,6 +104,11 @@ pub(crate) fn filter(
         "kv" => kv_filter(plugin, event),
         "fingerprint" => fingerprint_filter(plugin, event),
         "sleep" => sleep_filter(plugin, event),
+        "elasticsearch" => {
+            let mut event = event;
+            crate::elastic_query::lookup(plugin, &mut event)?;
+            Ok(vec![event])
+        }
         other => Err(fail(format!("plugin filter {other} is not implemented"))),
     }
 }
