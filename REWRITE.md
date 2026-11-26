@@ -132,4 +132,4 @@ Cargo 依赖只允许纯 Rust crate。不要引入会编译 C 或 C++ 的包（�
 
 ## Git
 
-远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `a3f3c17`。这次提交让页和检查点的字节跟 9.5.2 的 `MmapPageIOV2`、`FileCheckpointIO` 一致，并加上 `pqcheck`。队列还没接到管道上。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
+远程：`https://github.com/Shitiumisakana/Rstash.git`。每一片 `cargo test` 通过并更新本文件之后提交并推送。访问 GitHub 走系统代理 `http://127.0.0.1:7897`，不要直连。单次命令用 `git -c http.proxy=http://127.0.0.1:7897`，不要改 git config。推送前 `origin/master` 是 `955e7d1`。页和检查点在 `261488e`，套接字测试避开了 Windows 上不能复用的 TCP 临时端口。队列还没接到管道上。推送失败就保留本地提交，在本文件写明失败原因，下一位先推再写代码。不提交密钥、`path.data`、日志。`.gitignore` 忽略 `target/`。
