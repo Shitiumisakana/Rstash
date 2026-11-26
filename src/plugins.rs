@@ -44,7 +44,10 @@ pub(crate) fn known(kind: Kind, name: &str) -> bool {
                     | "sleep"
             )
             | (Kind::Output, "null" | "sink" | "file")
-            | (Kind::Codec, "dots" | "json" | "json_lines" | "rubydebug")
+            | (
+                Kind::Codec,
+                "dots" | "json" | "json_lines" | "rubydebug" | "multiline"
+            )
     )
 }
 
@@ -98,6 +101,7 @@ pub(crate) fn encode(
             .map(|text| text + delimiter)
             .map_err(|error| fail(error.to_string())),
         "rubydebug" => Ok(rubydebug(event, metadata)),
+        "multiline" => Err(fail("codec multiline cannot encode")),
         other => Err(fail(format!("plugin codec {other} is not implemented"))),
     }
 }
@@ -146,6 +150,12 @@ fn stdin_input(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunEr
     };
     if matches!(codec_name(plugin).as_str(), "json" | "json_lines") {
         return decode_events(&codec_name(plugin), &text);
+    }
+    if let Some(codec) = codec_plugin(plugin)
+        && codec.name == "multiline"
+    {
+        let events = crate::grok::multiline_decode(codec, &text, settings.ecs, false)?;
+        return decorate_stdin(events, settings);
     }
     let host = crate::run::hostname();
     let ecs = settings.ecs != Ecs::Disabled;
@@ -344,6 +354,22 @@ fn file_input(plugin: &Plugin, settings: &Settings) -> Result<Vec<Event>, RunErr
     };
     if let Some(sincedb) = arg_string(plugin, "sincedb_path") {
         fs::write(&sincedb, bytes.len().to_string()).map_err(|error| fail(error.to_string()))?;
+    }
+    if let Some(codec) = codec_plugin(plugin)
+        && codec.name == "multiline"
+    {
+        let mut events = crate::grok::multiline_decode(codec, body, settings.ecs, true)?;
+        for event in &mut events {
+            event
+                .set_field("path", Value::from(path.as_str()))
+                .map_err(err)?;
+            if settings.ecs != Ecs::Disabled {
+                event
+                    .set_field("[log][file][path]", Value::from(path.as_str()))
+                    .map_err(err)?;
+            }
+        }
+        return Ok(events);
     }
     let mut events = Vec::new();
     for line in body.split_inclusive('\n') {
@@ -1334,6 +1360,29 @@ fn string_list(plugin: &Plugin, name: &str) -> Result<Vec<String>, RunError> {
         Some(Arg::String(value)) => Ok(vec![value.clone()]),
         Some(Arg::Array(items)) => items.iter().map(arg_text).collect(),
         Some(other) => Ok(vec![arg_text(other)?]),
+    }
+}
+
+fn decorate_stdin(events: Vec<Event>, settings: &Settings) -> Result<Vec<Event>, RunError> {
+    let host = crate::run::hostname();
+    let ecs = settings.ecs != Ecs::Disabled;
+    let host_field = if ecs { "[host][hostname]" } else { "host" };
+    let mut decorated = Vec::new();
+    for mut event in events {
+        if !event.includes(host_field).map_err(err)? {
+            event
+                .set_field(host_field, Value::from(host.as_str()))
+                .map_err(err)?;
+        }
+        decorated.push(event);
+    }
+    Ok(decorated)
+}
+
+fn codec_plugin(plugin: &Plugin) -> Option<&Plugin> {
+    match arg(plugin, "codec") {
+        Some(Arg::Plugin(codec)) => Some(codec),
+        _ => None,
     }
 }
 

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+fancy-regex = { version = "0.20.2", default-features = false, features = ["std", "unicode", "variable-lookbehinds"] }
 serde_json = "1.0.154"
 
 [dev-dependencies]

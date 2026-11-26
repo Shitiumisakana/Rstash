@@ -181,6 +181,11 @@ fn apply_inner(plugin: &Plugin, event: &mut Event) -> Result<(), RunError> {
             }
         }
     }
+    filter_matched(plugin, event)
+}
+
+/// `LogStash::Filters::Base#filter_matched`: add_field, remove_field, add_tag, remove_tag.
+pub(crate) fn filter_matched(plugin: &Plugin, event: &mut Event) -> Result<(), RunError> {
     if let Some(arg) = arg(plugin, "add_field") {
         for (field, value) in pairs(arg)? {
             let field = event.sprintf(&field).map_err(event_fail)?;

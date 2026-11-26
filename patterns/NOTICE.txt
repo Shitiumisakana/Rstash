@@ -1,0 +1,2 @@
+Pattern files under ecs-v1/ and legacy/ are the logstash-patterns-core 4.3.4
+definitions shipped with Logstash 9.5.2. That gem is Apache License 2.0.

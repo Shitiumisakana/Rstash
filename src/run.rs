@@ -248,7 +248,7 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
             Ok(vec![event])
         }
         (Kind::Filter, "grok") => {
-            crate::grok::apply(plugin, &mut event)?;
+            crate::grok::apply(plugin, &mut event, shared.settings.ecs)?;
             Ok(vec![event])
         }
         (Kind::Filter, _) => crate::plugins::filter(plugin, event, &shared.settings),
