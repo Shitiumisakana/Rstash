@@ -23,6 +23,12 @@ const GEMS: &[Gem] = &[
         children: &[],
     },
     Gem {
+        name: "logstash-codec-cef",
+        version: "6.2.8",
+        group: "codec",
+        children: &[],
+    },
+    Gem {
         name: "logstash-codec-dots",
         version: "3.0.6",
         group: "codec",

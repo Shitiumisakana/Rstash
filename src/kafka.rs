@@ -15,7 +15,7 @@ use crate::codec::TextCodec;
 use crate::event::Event;
 use crate::lscl::{Arg, Plugin};
 use crate::mutate::filter_matched;
-use crate::run::{RunError, Settings, encode_event, fail};
+use crate::run::{Ecs, RunError, Settings, encode_event, fail};
 use crate::value::Value;
 
 const METADATA: i16 = 3;
@@ -23,7 +23,7 @@ const PRODUCE: i16 = 0;
 const METADATA_VERSION: i16 = 4;
 const PRODUCE_VERSION: i16 = 3;
 
-pub(crate) fn send(plugin: &Plugin, event: &Event) -> Result<(), RunError> {
+pub(crate) fn send(plugin: &Plugin, event: &Event, ecs: Ecs) -> Result<(), RunError> {
     let topic = text(plugin, "topic_id").ok_or_else(|| fail("kafka output requires topic_id"))?;
     let topic = event
         .sprintf(&topic)
@@ -56,7 +56,7 @@ pub(crate) fn send(plugin: &Plugin, event: &Event) -> Result<(), RunError> {
             "A negative retry count ({retries}) is not valid. Must be a value >= 0"
         )));
     }
-    let payload = encode_event(plugin, event, "plain")?;
+    let payload = encode_event(plugin, event, "plain", ecs)?;
     let key = match text(plugin, "message_key") {
         Some(template) => Some(
             event
@@ -1073,6 +1073,17 @@ fn events_from_record(
             })
             .ok_or_else(|| fail(crate::avro::missing_schema()))?;
         vec![crate::avro::decode(codec, &record.value, settings.ecs)?]
+    } else if codec_name == "cef" {
+        let codec =
+            plugin
+                .args
+                .iter()
+                .find(|(key, _)| key == "codec")
+                .and_then(|(_, arg)| match arg {
+                    Arg::Plugin(codec) => Some(codec),
+                    _ => None,
+                });
+        crate::cef::decode(codec, &record.value, settings.ecs)?
     } else {
         return Err(fail(format!(
             "plugin codec {codec_name} is not implemented"

@@ -8,6 +8,7 @@ pub mod cli;
 mod api;
 mod avro;
 mod bus;
+mod cef;
 mod codec;
 mod digest;
 mod dlq;

@@ -446,7 +446,7 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
         }
         (Kind::Filter, _) => crate::plugins::filter(plugin, event, &shared.settings),
         (Kind::Output, "stdout") => {
-            let encoded = encode_stdout(plugin, &event)?;
+            let encoded = encode_stdout(plugin, &event, shared.settings.ecs)?;
             shared.stdout.lock().expect("stdout").push_str(&encoded);
             shared.events.lock().expect("events").push(event.clone());
             Ok(vec![event])
@@ -456,19 +456,19 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
             Ok(Vec::new())
         }
         (Kind::Output, "file") => {
-            let encoded = encode_stdout(plugin, &event)?;
+            let encoded = encode_stdout(plugin, &event, shared.settings.ecs)?;
             crate::plugins::write_file(plugin, &encoded)?;
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
         }
         (Kind::Output, "tcp") => {
-            let encoded = encode_event(plugin, &event, "json")?;
+            let encoded = encode_event(plugin, &event, "json", shared.settings.ecs)?;
             crate::netio::tcp_send(plugin, &encoded)?;
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
         }
         (Kind::Output, "udp") => {
-            let encoded = encode_event(plugin, &event, "json")?;
+            let encoded = encode_event(plugin, &event, "json", shared.settings.ecs)?;
             crate::netio::udp_send(plugin, &event, &encoded)?;
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
@@ -484,7 +484,7 @@ fn dispatch(plugin: &Plugin, mut event: Event, shared: &Shared) -> Result<Vec<Ev
             Ok(Vec::new())
         }
         (Kind::Output, "kafka") => {
-            crate::kafka::send(plugin, &event)?;
+            crate::kafka::send(plugin, &event, shared.settings.ecs)?;
             shared.events.lock().expect("events").push(event);
             Ok(Vec::new())
         }
@@ -592,6 +592,9 @@ fn check_arg(arg: &Arg) -> Result<(), RunError> {
             }
             if plugin.name == "avro" {
                 crate::avro::prepare(plugin)?;
+            }
+            if plugin.name == "cef" {
+                crate::cef::prepare(plugin)?;
             }
             Ok(())
         }
@@ -783,14 +786,15 @@ fn codec_known(name: &str) -> bool {
     matches!(name, "plain" | "line") || crate::plugins::known(Kind::Codec, name)
 }
 
-fn encode_stdout(plugin: &Plugin, event: &Event) -> Result<String, RunError> {
-    encode_event(plugin, event, "rubydebug")
+fn encode_stdout(plugin: &Plugin, event: &Event, ecs: Ecs) -> Result<String, RunError> {
+    encode_event(plugin, event, "rubydebug", ecs)
 }
 
 pub(crate) fn encode_event(
     plugin: &Plugin,
     event: &Event,
     default_codec: &str,
+    ecs: Ecs,
 ) -> Result<String, RunError> {
     let codec = codec_of(plugin, default_codec)?;
     let body = if let Some(format) = &codec.format {
@@ -805,6 +809,7 @@ pub(crate) fn encode_event(
                     .ok_or_else(|| fail(crate::avro::missing_schema()))?;
                 crate::avro::encode(codec_plugin, event)?
             }
+            "cef" => crate::cef::encode(codec.plugin.as_ref(), event, ecs)?,
             name => crate::plugins::encode(name, &codec.delimiter, codec.metadata, event)?,
         }
     };
